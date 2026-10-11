@@ -1,0 +1,2120 @@
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import Quickshell.Networking
+import Quickshell.Bluetooth
+import Quickshell.Services.Pipewire
+import Quickshell.Services.UPower
+import qs.Commons
+import qs.Ui
+
+// oma.controlpanel — a Dank-Material-style control center for the Omarchy bar.
+//
+// A popup anchored to the bar button: a hero, a grid of quick toggles
+// (network, Bluetooth, night light, do-not-disturb), the audio and brightness
+// sliders, and a power section (battery + power profile).
+//
+// Live system state comes straight from Quickshell's own services
+// (Networking, Bluetooth, Pipewire, UPower) so nothing here depends on
+// Omarchy's first-party panels being loaded. The handful of things Quickshell
+// does not model (brightness, night light, DND, power profile, connection
+// name) are read back from the omarchy-* helpers in short-lived Processes and
+// written through the same helpers, so behaviour matches the rest of the
+// desktop.
+Panel {
+  id: root
+  moduleName: "oma.controlpanel"
+  ipcTarget: "oma.controlpanel"
+
+  // Injected by BarWidget.qml's injectPanel(), which owns the actual bar
+  // button. KeyboardPanel anchors to the bar item rather than to this panel,
+  // and `owner` has to be the bar widget so popout routing finds it.
+  property var anchorItem: null
+  property var hostWidget: null
+  readonly property var barIdentity: hostWidget || root
+
+  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color accent: Color.accent
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property color dim: Qt.darker(foreground, 1.4)
+
+  // ----------------------------------------------------------------- glyphs
+  // Each written as a literal so the surrogate pairs survive tooling that
+  // mangles \u escapes above the BMP.
+  readonly property string glyphPanel: "󰕮"
+  readonly property string glyphWifiOn: "󰖩"
+  readonly property string glyphWifiOff: "󰖪"
+  readonly property string glyphWired: "󰈀"
+  readonly property string glyphBtOn: "󰂯"
+  readonly property string glyphBtConnected: "󰂱"
+  readonly property string glyphBtOff: "󰂲"
+  readonly property string glyphMoon: "󰖔"
+  readonly property string glyphDisplay: "󰍹"
+  readonly property string glyphForward: "󰅂"
+  readonly property string glyphBell: "󰂚"
+  readonly property string glyphBellOff: "󰂛"
+  readonly property string glyphVolume: "󰕾"
+  readonly property string glyphMute: "󰝟"
+  readonly property string glyphBrightness: "󰃠"
+  readonly property string glyphBattery: "󰁹"
+  readonly property string glyphBack: "󰅁"
+  readonly property string glyphGlobe: "󰖟"
+  readonly property string glyphSpeedometer: "󰓅"
+  readonly property string glyphTimer: "󰔟"
+  readonly property string glyphDownload: "󰇚"
+  readonly property string glyphUpload: "󰕒"
+
+  // ------------------------------------------------------------ live state
+  readonly property var netDevices: Networking.devices ? Networking.devices.values : []
+  readonly property bool hasWifi: {
+    for (var i = 0; i < netDevices.length; i++)
+      if (netDevices[i] && netDevices[i].type === DeviceType.Wifi) return true
+    return false
+  }
+  readonly property bool wifiOn: Networking.wifiEnabled
+  // { type, name } from `omarchy-network-status`; empty until the first poll.
+  property var netInfo: ({})
+
+  readonly property var btAdapter: Bluetooth.defaultAdapter
+  readonly property bool btOn: btAdapter !== null && btAdapter.enabled
+  readonly property var btDevices: Bluetooth.devices ? Bluetooth.devices.values : []
+  readonly property int btConnectedCount: {
+    var n = 0
+    for (var i = 0; i < btDevices.length; i++)
+      if (btDevices[i] && btDevices[i].connected) n++
+    return n
+  }
+
+  readonly property var sink: Pipewire.defaultAudioSink
+  readonly property real volume: sink && sink.audio ? sink.audio.volume : 0
+  readonly property bool muted: sink && sink.audio ? sink.audio.muted : false
+  readonly property string sinkName: sink ? String(sink.nickname || sink.description || sink.name || "") : ""
+
+  readonly property var battery: UPower.displayDevice
+  readonly property bool hasBattery: battery !== null && battery.isPresent === true
+  readonly property int batteryPercent: {
+    if (!battery || battery.percentage === undefined) return -1
+    var p = Number(battery.percentage)
+    if (!isFinite(p)) return -1
+    return Math.round(p <= 1 ? p * 100 : p)
+  }
+  readonly property string batteryText: {
+    if (!hasBattery) return ""
+    if (batteryPercent < 0) return ""
+    return batteryPercent + "%"
+  }
+
+  // Polled external state.
+  property int brightness: -1          // percent, -1 when unknown
+  property bool nightlight: false
+  property bool dnd: false
+  property string powerProfile: ""
+  property bool profileAvailable: false
+  property string hostname: ""
+
+  // ------------------------------------------------- network detail sub-page
+  // "home" | "network" | "bluetooth" | "display". A tile body (or the Display
+  // entry row) opens its detail page; the back button (or Esc) returns home.
+  property string page: "home"
+  // Parsed `omarchy-network-status --verbose` key/value lines, e.g. ip,
+  // gateway, iface, type, speed, internet_ping_ms.
+  property var netDetail: ({})
+  property bool netDetailLoaded: false
+
+  // Speed test, modelled on the built-in omarchy.speedtest panel: measure
+  // download for a few seconds, then upload, streaming Mbps from
+  // `omarchy-network-speedtest down|up`.
+  property bool speedRunning: false
+  property string speedPhase: ""       // "down" | "up" | ""
+  property string speedDown: ""
+  property string speedUp: ""
+  property string speedError: ""
+  property string speedStderr: ""
+  property bool speedExpectedStop: false
+  property bool speedPendingRun: false
+
+  // Bluetooth page state: address -> "connecting" | "disconnecting" |
+  // "forgetting", kept only to keep the UI responsive while BlueZ catches up.
+  // Discovery is owned by this instance while the page is open so it can be
+  // stopped again on leave (BlueZ discovery holds the radio busy).
+  property var btPending: ({})
+  property bool btOwnsDiscovery: false
+
+  // Display page state, mirroring the built-in omarchy.monitor panel: monitors
+  // (and the focused one), its scale, and the text-size stop being previewed.
+  // Brightness is already polled for the home slider and reused here.
+  property string focusedMonitor: ""
+  property string monitorScale: ""
+  property var displays: []
+  property int enabledDisplayCount: 0
+  property int textSizePreviewIndex: -1
+  readonly property var scalePresets: ["1", "1.25", "1.6", "2", "3", "4"]
+  readonly property var textSizeStops: [9, 10, 11, 12, 14, 16, 20]
+
+  // ----------------------------------------------------------- derived text
+  readonly property string netSubtitle: {
+    var t = String(netInfo.type || "")
+    var n = String(netInfo.name || "")
+    if (t === "wifi") return n !== "" ? n : "Wi-Fi"
+    if (t === "ethernet") return n !== "" ? n : "Ethernet"
+    // No helper answer yet: fall back to whatever the live devices report.
+    for (var i = 0; i < netDevices.length; i++) {
+      var d = netDevices[i]
+      if (d && d.connected) return String(d.name || "Connected")
+    }
+    return "Disconnected"
+  }
+  readonly property string netIcon: {
+    var t = String(netInfo.type || "")
+    if (t === "ethernet") return glyphWired
+    if (t === "wifi") return wifiOn ? glyphWifiOn : glyphWifiOff
+    for (var i = 0; i < netDevices.length; i++) {
+      var d = netDevices[i]
+      if (d && d.connected && d.type === DeviceType.Wired) return glyphWired
+    }
+    return hasWifi ? (wifiOn ? glyphWifiOn : glyphWifiOff) : glyphWired
+  }
+  readonly property string btIcon: !btOn ? glyphBtOff : (btConnectedCount > 0 ? glyphBtConnected : glyphBtOn)
+  readonly property string btSubtitle: {
+    if (btAdapter === null) return "No adapter"
+    if (!btOn) return "Off"
+    if (btConnectedCount === 0) return "On"
+    return btConnectedCount === 1 ? "1 device" : btConnectedCount + " devices"
+  }
+
+  // ------------------------------------------------- network page derived
+  readonly property string netLocalIp: String(netDetail.ip || "")
+  readonly property string netGateway: String(netDetail.gateway || "")
+  readonly property string netIface: String(netDetail.iface || netInfo.name || "")
+  readonly property string netLinkSpeed: netDetail.speed ? String(netDetail.speed) + " Mbps" : ""
+  readonly property string netPing: {
+    var p = Number(String(netDetail.internet_ping_ms || ""))
+    if (!isFinite(p) || p <= 0) return ""
+    return (p < 10 ? p.toFixed(1) : String(Math.round(p))) + " ms"
+  }
+  readonly property string speedDownText: formatMbps(speedDown)
+  readonly property string speedUpText: formatMbps(speedUp)
+  readonly property bool speedHasResult: speedDownText !== "" || speedUpText !== ""
+
+  // ------------------------------------------------- bluetooth page derived
+  // Device rows are turned into plain objects: a Repeater model that holds the
+  // live Device wrappers would race BlueZ teardown, so each row carries only
+  // primitives and actions resolve the live device by address at click time.
+  readonly property var btLists: {
+    var out = { connected: [], known: [], available: [] }
+    var devs = btDevices
+    for (var i = 0; i < devs.length; i++) {
+      var d = devs[i]
+      if (!d || !btHasHumanName(d)) continue
+      var row = {
+        address: btAddr(d),
+        label: btLabel(d),
+        connected: d.connected === true,
+        batteryAvailable: d.batteryAvailable === true,
+        battery: d.battery !== undefined ? Number(d.battery) : 0,
+        pairing: d.pairing === true
+      }
+      if (row.connected) out.connected.push(row)
+      else if (d.paired || d.bonded || d.trusted) out.known.push(row)
+      else out.available.push(row)
+    }
+    btSortRows(out.connected)
+    btSortRows(out.known)
+    btSortRows(out.available)
+    return out
+  }
+  readonly property var btConnectedRows: btLists.connected
+  readonly property var btKnownRows: btLists.known
+  readonly property var btAvailableRows: btLists.available
+  readonly property bool btScanning: btAdapter !== null && btAdapter.enabled && btAdapter.discovering === true
+  readonly property int btRowCount: btConnectedRows.length + btKnownRows.length + btAvailableRows.length
+
+  // ------------------------------------------------- display page derived
+  readonly property var focusedDisplay: {
+    for (var i = 0; i < displays.length; i++)
+      if (displays[i] && displays[i].focused) return displays[i]
+    return null
+  }
+  readonly property var scaleValues: focusedDisplay
+    ? availableScales(scalePresets, focusedDisplay.width, focusedDisplay.height)
+    : scalePresets
+  readonly property var scaleOptions: {
+    var opts = []
+    for (var i = 0; i < scaleValues.length; i++)
+      opts.push({ value: String(scaleValues[i]), label: effectiveScale(scaleValues[i]) + "x" })
+    return opts
+  }
+  // The preset whose effective scale matches the monitor's current one, if any.
+  readonly property string currentScaleValue: {
+    if (!focusedDisplay) return ""
+    var idx = matchingScaleIndex(scaleValues, monitorScale, focusedDisplay.width, focusedDisplay.height)
+    return idx >= 0 ? String(scaleValues[idx]) : ""
+  }
+  readonly property string displaySubtitle: focusedMonitor !== ""
+    ? focusedMonitor + (monitorScale !== "" ? " · " + monitorScale + "x" : "")
+    : ""
+  readonly property int textSizeIndex: textSizePreviewIndex >= 0 ? textSizePreviewIndex : nearestTextStop(Style.font.baseSize)
+  readonly property int textSizePx: textSizePreviewIndex >= 0 ? textSizeStops[textSizePreviewIndex] : Style.font.baseSize
+
+  function btLabel(d) {
+    if (!d) return ""
+    return String(d.deviceName || d.name || "").trim()
+  }
+  function btAddr(d) {
+    return d ? String(d.address || "") : ""
+  }
+  function btIsUuidLike(v) {
+    var t = String(v || "").trim()
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t)
+        || /^[0-9a-f]{32}$/i.test(t)
+  }
+  function btIsAddressLike(v) {
+    return /^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$/i.test(String(v || "").trim())
+  }
+  // BlueZ exposes many devices with only a UUID or raw address as their name;
+  // hide those so the list only shows things a person can recognise.
+  function btHasHumanName(d) {
+    var l = btLabel(d)
+    return l !== "" && !btIsUuidLike(l) && !btIsAddressLike(l)
+  }
+  function btSortRows(rows) {
+    rows.sort(function(a, b) { return a.label.localeCompare(b.label) })
+  }
+
+  function formatMbps(raw) {
+    if (raw === undefined || raw === null || String(raw).trim() === "") return ""
+    var v = Number(raw)
+    if (!isFinite(v) || v < 0) return ""
+    return v < 10 ? v.toFixed(1) : String(Math.round(v))
+  }
+
+  // -------------------------------------------------------------- actions
+  function refresh() {
+    netProc.running = true
+    brightnessGetProc.running = true
+    nightlightGetProc.running = true
+    dndGetProc.running = true
+    profileGetProc.running = true
+    hostProc.running = true
+    monitorStateProc.running = true
+    if (page === "network") netDetailProc.running = true
+  }
+
+  function openFromHotkey() {
+    open()
+    refresh()
+  }
+
+  onOpenedChanged: {
+    if (opened) {
+      refresh()
+    } else {
+      // Dismissing the panel must not leave the speed-test traffic running nor
+      // the Bluetooth radio scanning.
+      stopSpeedTest()
+      stopBtDiscovery()
+      page = "home"
+    }
+  }
+
+  function toggleWifi() {
+    if (!hasWifi) return
+    Networking.wifiEnabled = !Networking.wifiEnabled
+  }
+
+  function toggleBluetooth() {
+    if (btAdapter === null) return
+    Quickshell.execDetached(["omarchy-bluetooth-power", btOn ? "off" : "on"])
+  }
+
+  function toggleNightlight() {
+    Quickshell.execDetached(["omarchy-toggle-nightlight"])
+    // The helper retries for up to ~2s while hyprsunset settles, so poll twice.
+    nightlightTimer.restart()
+  }
+
+  function setDnd(on) {
+    Quickshell.execDetached(["omarchy-shell", "notifications", "setDnd", on ? "on" : "off"])
+    dndTimer.restart()
+  }
+
+  function setVolume(v) {
+    if (sink && sink.audio) sink.audio.volume = Math.max(0, Math.min(1, Number(v)))
+  }
+
+  function toggleMute() {
+    if (sink && sink.audio) sink.audio.muted = !sink.audio.muted
+  }
+
+  function clampBrightnessPercent(v) {
+    var n = Math.round(Number(v) * 100)
+    if (!isFinite(n)) n = 50
+    return Math.max(1, Math.min(100, n))
+  }
+
+  function stageBrightness(v) {
+    brightnessPending = clampBrightnessPercent(v)
+    brightnessDebounce.restart()
+  }
+
+  function commitBrightness(v) {
+    brightnessPending = clampBrightnessPercent(v)
+    brightnessDebounce.stop()
+    applyBrightness()
+  }
+
+  function applyBrightness() {
+    // Optimistic: the slider should not snap back while the helper runs.
+    brightness = brightnessPending
+    Quickshell.execDetached(["omarchy-brightness-display", "--no-osd", brightnessPending + "%"])
+  }
+
+  function setPowerProfile(p) {
+    if (String(p) === "" || String(p) === powerProfile) return
+    powerProfile = String(p) // optimistic
+    Quickshell.execDetached(["powerprofilesctl", "set", String(p)])
+    profileTimer.restart()
+  }
+
+  // --------------------------------------------------------- network actions
+  function openNetworkPage() {
+    stopBtDiscovery()
+    page = "network"
+    netDetailProc.running = true
+  }
+
+  function backToHome() {
+    stopSpeedTest()
+    stopBtDiscovery()
+    page = "home"
+  }
+
+  function startSpeedTest() {
+    if (speedProc.running) {
+      // A stop's SIGTERM is still in flight; Process.running stays true until
+      // the child exits, so queue the fresh run for onExited.
+      if (speedExpectedStop) speedPendingRun = true
+      return
+    }
+    speedError = ""
+    speedDown = ""
+    speedUp = ""
+    speedRunning = true
+    startSpeedPhase("down")
+  }
+
+  function startSpeedPhase(nextPhase) {
+    speedExpectedStop = false
+    speedPhase = nextPhase
+    speedStderr = ""
+    speedProc.command = ["omarchy-network-speedtest", nextPhase]
+    speedProc.running = true
+    speedPhaseTimer.restart()
+  }
+
+  function stopSpeedPhase() {
+    speedPhaseTimer.stop()
+    if (speedProc.running) {
+      speedExpectedStop = true
+      speedProc.running = false
+      return
+    }
+    finishSpeedPhase()
+  }
+
+  function finishSpeedPhase() {
+    if (speedPhase === "down") {
+      startSpeedPhase("up")
+      return
+    }
+    speedPhase = ""
+    speedRunning = false
+    speedExpectedStop = false
+  }
+
+  function stopSpeedTest() {
+    speedPendingRun = false
+    speedPhaseTimer.stop()
+    // Clear the phase before killing the process: onExited advances to upload
+    // when it still reads "down".
+    speedPhase = ""
+    speedRunning = false
+    if (speedProc.running) {
+      speedExpectedStop = true
+      speedProc.running = false
+    }
+  }
+
+  function updateSpeedLine(line) {
+    var value = parseFloat(line)
+    if (!isFinite(value) || value < 0) return
+    if (speedPhase === "down") speedDown = String(value)
+    else if (speedPhase === "up") speedUp = String(value)
+  }
+
+  // -------------------------------------------------------- bluetooth actions
+  function openBluetoothPage() {
+    page = "bluetooth"
+    startBtDiscovery()
+  }
+
+  function btDeviceFor(address) {
+    if (!address) return null
+    for (var i = 0; i < btDevices.length; i++)
+      if (btAddr(btDevices[i]) === address) return btDevices[i]
+    return null
+  }
+
+  function btPendingAction(address) {
+    return address && btPending && btPending[address] ? btPending[address] : ""
+  }
+
+  function setBtPending(address, action) {
+    if (!address) return
+    var next = ({})
+    for (var k in btPending) next[k] = btPending[k]
+    if (action) next[address] = action
+    else delete next[address]
+    btPending = next
+    if (action) btPendingTimeout.restart()
+  }
+
+  function btConnect(row) {
+    if (!row || !row.address) return
+    var d = btDeviceFor(row.address)
+    if (d && d.connected) return
+    var known = d && (d.paired || d.bonded || d.trusted)
+    setBtPending(row.address, "connecting")
+    Quickshell.execDetached(["omarchy-bluetooth-device", known ? "connect" : "pair", row.address])
+  }
+
+  function btDisconnect(row) {
+    if (!row || !row.address) return
+    setBtPending(row.address, "disconnecting")
+    var d = btDeviceFor(row.address)
+    if (d && d.disconnect) d.disconnect()
+    Quickshell.execDetached(["omarchy-bluetooth-device", "disconnect", row.address])
+  }
+
+  function btForget(row) {
+    if (!row || !row.address) return
+    setBtPending(row.address, "forgetting")
+    Quickshell.execDetached(["omarchy-bluetooth-device", "forget", row.address])
+  }
+
+  // Left click toggles the connection; right click forgets a remembered one.
+  function btActivate(row) {
+    if (!row) return
+    if (row.connected) btDisconnect(row)
+    else btConnect(row)
+  }
+  function btSecondary(row, section) {
+    if (section === "connected" || section === "known") btForget(row)
+  }
+
+  // Drop a pending flag as soon as the live device agrees the action landed.
+  function syncBtPending() {
+    var next = ({})
+    var changed = false
+    for (var address in btPending) {
+      var action = btPending[address]
+      var d = btDeviceFor(address)
+      var done = (action === "connecting" && d && d.connected)
+              || (action === "disconnecting" && (!d || !d.connected))
+              || (action === "forgetting" && (!d || (!d.paired && !d.bonded && !d.trusted)))
+      if (done) changed = true
+      else next[address] = action
+    }
+    if (changed) btPending = next
+  }
+
+  function startBtDiscovery() {
+    if (btAdapter && btAdapter.enabled && !btAdapter.discovering) {
+      btOwnsDiscovery = true
+      btAdapter.discovering = true
+    }
+  }
+
+  function stopBtDiscovery() {
+    // Only stop discovery this instance started; another client (the built-in
+    // Bluetooth panel) may hold its own session.
+    if (btAdapter && btAdapter.discovering && btOwnsDiscovery) btAdapter.discovering = false
+    btOwnsDiscovery = false
+  }
+
+  // ---------------------------------------------------------- display actions
+  function openDisplayPage() {
+    page = "display"
+    monitorStateProc.running = true
+  }
+
+  function updateDisplays(json) {
+    var parsed = []
+    try { parsed = JSON.parse(String(json || "[]")) } catch (e) { parsed = [] }
+    if (!Array.isArray(parsed)) parsed = []
+    displays = parsed
+    var n = 0
+    for (var i = 0; i < parsed.length; i++)
+      if (parsed[i] && parsed[i].enabled) n++
+    enabledDisplayCount = n
+  }
+
+  function toggleDisplay(name, enabled) {
+    // Only a plain connector name may pass: it is written into the Lua string
+    // eval'd below.
+    if (!name || !/^[A-Za-z0-9._-]+$/.test(String(name))) return
+    // Never leave the desktop with no display enabled.
+    if (enabled && enabledDisplayCount <= 1) return
+    // Hyprland 0.56 dropped the legacy `hyprctl keyword monitor` parser; the
+    // Lua `hl.monitor` call is what Omarchy's own helpers now use.
+    var expr = enabled
+      ? 'hl.monitor({ output = "' + name + '", disabled = true })'
+      : 'hl.monitor({ output = "' + name + '", disabled = false })'
+    monitorToggleProc.command = ["hyprctl", "eval", expr]
+    if (!monitorToggleProc.running) monitorToggleProc.running = true
+  }
+
+  function setMonitorScale(scale) {
+    if (String(scale || "") === "") return
+    scaleProc.command = ["bash", "-c", "omarchy-hyprland-monitor-scaling " + scale]
+    if (!scaleProc.running) scaleProc.running = true
+  }
+
+  function nearestTextStop(px) {
+    var best = 0
+    var bestDist = 1e9
+    for (var i = 0; i < textSizeStops.length; i++) {
+      var d = Math.abs(textSizeStops[i] - Number(px))
+      if (d < bestDist) { bestDist = d; best = i }
+    }
+    return best
+  }
+
+  function setTextSize(px) {
+    textSizeProc.command = ["omarchy-display-text-size", String(px)]
+    if (!textSizeProc.running) textSizeProc.running = true
+  }
+
+  // ---- scale math, ported from the built-in monitor panel's Model.js ----
+  function normalizeScale(scale) {
+    var n = parseFloat(String(scale || ""))
+    if (!isFinite(n)) return ""
+    return String(Math.round(n * 100) / 100)
+  }
+  function scaleGcd(a, b) {
+    while (b) {
+      var r = a % b
+      a = b
+      b = r
+    }
+    return a
+  }
+  function cleanScale(scale, width, height) {
+    var requested = Number(scale)
+    var w = Number(width)
+    var h = Number(height)
+    if (!isFinite(requested) || !isFinite(w) || !isFinite(h) || requested <= 0 || w <= 0 || h <= 0) return ""
+    var divisor = scaleGcd(Math.round(w * 120), Math.round(h * 120))
+    var units = Math.round(requested * 120)
+    if (units > divisor) units = divisor
+    while (divisor % units !== 0) units++
+    return normalizeScale(units / 120)
+  }
+  function matchingScaleIndex(scales, currentScale, width, height) {
+    var current = Number(currentScale)
+    if (!Array.isArray(scales) || !isFinite(current)) return -1
+    var bestIndex = -1
+    var bestDistance = Infinity
+    var normalized = normalizeScale(current)
+    for (var i = 0; i < scales.length; i++) {
+      if (cleanScale(scales[i], width, height) !== normalized) continue
+      var distance = Math.abs(Number(scales[i]) - current)
+      if (distance < bestDistance) { bestIndex = i; bestDistance = distance }
+    }
+    return bestIndex
+  }
+  function availableScales(scales, width, height) {
+    if (!Array.isArray(scales) || Number(width) <= 0 || Number(height) <= 0) return scales || []
+    var byEffective = {}
+    for (var i = 0; i < scales.length; i++) {
+      var requested = Number(scales[i])
+      var effective = Number(cleanScale(requested, width, height))
+      if (!isFinite(requested) || !isFinite(effective)) continue
+      var key = normalizeScale(effective)
+      var existing = byEffective[key]
+      if (!existing || Math.abs(requested - effective) < existing.distance)
+        byEffective[key] = { value: String(scales[i]), index: i, distance: Math.abs(requested - effective) }
+    }
+    return Object.keys(byEffective)
+      .map(function(key) { return byEffective[key] })
+      .sort(function(a, b) { return a.index - b.index })
+      .map(function(candidate) { return candidate.value })
+  }
+  function effectiveScale(scale) {
+    if (focusedDisplay) return cleanScale(scale, focusedDisplay.width, focusedDisplay.height)
+    return normalizeScale(scale)
+  }
+
+  property int brightnessPending: 50
+
+  // -------------------------------------------------------------- processes
+  Process {
+    id: netProc
+    command: ["omarchy-network-status"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var lines = String(text || "").split("\n").filter(function(l) { return l.trim() !== "" })
+        if (lines.length === 0) { root.netInfo = ({}); return }
+        var parts = lines[0].split("\t")
+        root.netInfo = { type: String(parts[0] || ""), name: String(parts[1] || "") }
+      }
+    }
+  }
+
+  Process {
+    id: netDetailProc
+    command: ["omarchy-network-status", "--verbose"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var map = ({})
+        var lines = String(text || "").split("\n")
+        for (var i = 0; i < lines.length; i++) {
+          var kv = lines[i].split("\t")
+          if (kv.length >= 2 && kv[0] !== "") map[kv[0]] = kv[1]
+        }
+        root.netDetail = map
+        root.netDetailLoaded = true
+      }
+    }
+  }
+
+  Process {
+    id: brightnessGetProc
+    command: ["omarchy-brightness-display"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var m = String(text || "").match(/\d+/)
+        if (m) {
+          root.brightness = parseInt(m[0], 10)
+          root.brightnessPending = root.brightness
+        }
+      }
+    }
+  }
+
+  Process {
+    id: nightlightGetProc
+    command: ["omarchy-toggle-nightlight", "--status"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var obj = JSON.parse(String(text || "{}"))
+          root.nightlight = obj && obj.enabled === true
+        } catch (e) {
+          // Helper unavailable or no hyprsunset: leave the previous value.
+        }
+      }
+    }
+  }
+
+  Process {
+    id: dndGetProc
+    command: ["omarchy-shell", "notifications", "dndState"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.dnd = String(text || "").trim() === "on"
+    }
+  }
+
+  Process {
+    id: profileGetProc
+    command: ["powerprofilesctl", "get"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var p = String(text || "").trim()
+        if (p !== "") {
+          root.powerProfile = p
+          root.profileAvailable = true
+        }
+      }
+    }
+  }
+
+  Process {
+    id: hostProc
+    command: ["uname", "-n"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.hostname = String(text || "").trim()
+    }
+  }
+
+  // `omarchy-monitor-state` prints eight lines: brightness, internal monitor,
+  // external monitor, internal-enabled, mirror, focused monitor, scale, and a
+  // JSON array of displays (name/enabled/focused/width/height).
+  Process {
+    id: monitorStateProc
+    command: ["omarchy-monitor-state"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var lines = String(text || "").split("\n")
+        root.focusedMonitor = String(lines[5] || "").trim()
+        root.monitorScale = root.normalizeScale(String(lines[6] || "").trim())
+        root.updateDisplays(String(lines[7] || "[]").trim())
+      }
+    }
+  }
+
+  Process {
+    id: scaleProc
+    stdout: StdioCollector { waitForEnd: true }
+    onRunningChanged: if (!running) root.refresh()
+  }
+
+  Process {
+    id: monitorToggleProc
+    stdout: StdioCollector { waitForEnd: true }
+    onRunningChanged: if (!running) root.refresh()
+  }
+
+  // Rewrites the shell override file; Style picks the new base-size up through
+  // its own file watch, so there is nothing to refresh here.
+  Process {
+    id: textSizeProc
+    stdout: StdioCollector { waitForEnd: true }
+  }
+
+  Process {
+    id: speedProc
+    stdout: SplitParser { onRead: function(line) { root.updateSpeedLine(line) } }
+    // Exit and stream-finished have no guaranteed order: when a failed exit
+    // beat the collector and published the generic message, replace it with
+    // the specific one once it lands.
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.speedStderr = String(text || "").trim()
+        if (root.speedError !== "" && root.speedStderr !== "") root.speedError = root.speedStderr
+      }
+    }
+    onExited: function(exitCode) {
+      speedPhaseTimer.stop()
+
+      if (root.speedPendingRun) {
+        root.speedPendingRun = false
+        root.speedExpectedStop = false
+        if (root.page === "network") Qt.callLater(root.startSpeedTest)
+        return
+      }
+
+      if (!root.speedExpectedStop && exitCode !== 0) {
+        root.speedError = root.speedStderr || "Speed test failed"
+        root.speedPhase = ""
+        root.speedRunning = false
+        return
+      }
+
+      root.speedExpectedStop = false
+      root.finishSpeedPhase()
+    }
+  }
+
+  // Keep the default sink live while the panel exists; without a tracker the
+  // node can be torn down between reads and the volume would read 0.
+  PwObjectTracker {
+    objects: root.sink ? [root.sink] : []
+  }
+
+  // ------------------------------------------------------------------ timers
+  Timer {
+    id: pollTimer
+    interval: 4000
+    repeat: true
+    running: root.opened
+    onTriggered: root.refresh()
+  }
+
+  Timer {
+    id: brightnessDebounce
+    interval: 130
+    repeat: false
+    onTriggered: root.applyBrightness()
+  }
+
+  Timer {
+    id: nightlightTimer
+    interval: 900
+    repeat: false
+    onTriggered: root.refresh()
+  }
+
+  Timer {
+    id: dndTimer
+    interval: 300
+    repeat: false
+    onTriggered: root.refresh()
+  }
+
+  Timer {
+    id: profileTimer
+    interval: 300
+    repeat: false
+    onTriggered: root.refresh()
+  }
+
+  Timer {
+    id: speedPhaseTimer
+    interval: 5000
+    repeat: false
+    onTriggered: root.stopSpeedPhase()
+  }
+
+  // Discovery can lapse (BlueZ times scans out), so nudge it back while the
+  // Bluetooth page is open. `!btScanning` also stops the nudge once it is up.
+  Timer {
+    id: btScanTimer
+    interval: 1000
+    repeat: true
+    running: root.page === "bluetooth" && root.btOn && !root.btScanning
+    onTriggered: root.startBtDiscovery()
+  }
+
+  // An action that never surfaces (device vanished) clears its pending label.
+  Timer {
+    id: btPendingTimeout
+    interval: 20000
+    repeat: false
+    onTriggered: root.btPending = ({})
+  }
+
+  Connections {
+    target: root.btAdapter
+    function onDiscoveringChanged() {
+      if (!root.btAdapter || !root.btAdapter.discovering) root.btOwnsDiscovery = false
+    }
+  }
+
+  // Device connect/disconnect/forget update the row lists; use that to drop
+  // the optimistic pending labels.
+  Connections {
+    target: root
+    function onBtListsChanged() { root.syncBtPending() }
+  }
+
+  // Once Style's base size catches up to the previewed text-size stop, drop the
+  // preview so the slider tracks the live value again.
+  Connections {
+    target: Style
+    function onFontBaseSizeChanged() {
+      if (root.textSizePreviewIndex >= 0
+          && root.nearestTextStop(Style.font.baseSize) === root.textSizePreviewIndex)
+        root.textSizePreviewIndex = -1
+    }
+  }
+
+  // -------------------------------------------------------------------- UI
+  KeyboardPanel {
+    id: panel
+    anchorItem: root.anchorItem
+    owner: root.barIdentity
+    bar: root.bar
+    open: root.opened
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(360))
+    contentHeight: panel.fittedContentHeight(contentHost.implicitHeight)
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      onCloseRequested: {
+        // Esc walks back from a sub-page before it dismisses the panel.
+        if (root.page !== "home") root.backToHome()
+        else root.close()
+      }
+      onTextKey: function(t) {
+        if (t === "r" || t === "R") root.refresh()
+      }
+
+      Item {
+        id: contentHost
+        width: parent.width
+        implicitHeight: root.page === "network" ? networkColumn.implicitHeight
+                      : root.page === "bluetooth" ? bluetoothColumn.implicitHeight
+                      : root.page === "display" ? displayColumn.implicitHeight
+                      : column.implicitHeight
+
+      Column {
+        id: column
+        width: parent.width
+        visible: root.page === "home"
+        spacing: Style.space(12)
+
+        PanelHero {
+          width: parent.width
+          title: "Control Panel"
+          meta: root.hostname !== "" ? root.hostname.toUpperCase() : "SYSTEM"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          iconComponent: Component {
+            Text {
+              text: root.glyphPanel
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.display
+            }
+          }
+        }
+
+        PanelSectionHeader {
+          text: "QUICK"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        Grid {
+          id: quickGrid
+          width: parent.width
+          columns: 2
+          spacing: Style.space(10)
+          readonly property real tileW: (width - spacing) / 2
+
+          ToggleTile {
+            width: quickGrid.tileW
+            icon: root.netIcon
+            label: "Network"
+            sub: root.netSubtitle
+            checked: root.wifiOn
+            showSwitch: root.hasWifi
+            activateOnClick: true
+            onActivated: root.openNetworkPage()
+            onToggled: root.toggleWifi()
+          }
+
+          ToggleTile {
+            width: quickGrid.tileW
+            icon: root.btIcon
+            label: "Bluetooth"
+            sub: root.btSubtitle
+            checked: root.btOn
+            showSwitch: root.btAdapter !== null
+            activateOnClick: true
+            onActivated: root.openBluetoothPage()
+            onToggled: root.toggleBluetooth()
+          }
+
+          ToggleTile {
+            width: quickGrid.tileW
+            icon: root.glyphMoon
+            label: "Night Light"
+            sub: root.nightlight ? "On" : "Off"
+            checked: root.nightlight
+            onToggled: root.toggleNightlight()
+          }
+
+          ToggleTile {
+            width: quickGrid.tileW
+            icon: root.dnd ? root.glyphBellOff : root.glyphBell
+            label: "Do Not Disturb"
+            sub: root.dnd ? "On" : "Off"
+            checked: root.dnd
+            onToggled: root.setDnd(!root.dnd)
+          }
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        PanelSectionHeader {
+          text: "AUDIO"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        SliderRow {
+          width: parent.width
+          icon: root.muted ? root.glyphMute : root.glyphVolume
+          label: "Volume"
+          sub: root.sinkName
+          valueText: root.muted ? "Muted" : Math.round(root.volume * 100) + "%"
+          value: root.muted ? 0 : root.volume
+          onMoved: function(v) { root.setVolume(v) }
+          onReleased: function(v) { root.setVolume(v) }
+          onSecondary: root.toggleMute()
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        PanelSectionHeader {
+          text: "DISPLAY"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        OpenRow {
+          width: parent.width
+          icon: root.glyphDisplay
+          label: "Display"
+          sub: root.displaySubtitle
+          onClicked: root.openDisplayPage()
+        }
+
+        SliderRow {
+          width: parent.width
+          icon: root.glyphBrightness
+          label: "Brightness"
+          valueText: root.brightness >= 0 ? root.brightness + "%" : "--"
+          value: root.brightness >= 0 ? root.brightness / 100 : 0
+          onMoved: function(v) { root.stageBrightness(v) }
+          onReleased: function(v) { root.commitBrightness(v) }
+        }
+
+        PanelSeparator {
+          visible: root.hasBattery || root.profileAvailable
+          foreground: root.foreground
+        }
+
+        PanelSectionHeader {
+          visible: root.hasBattery || root.profileAvailable
+          text: "POWER"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        Item {
+          width: parent.width
+          visible: root.hasBattery
+          implicitHeight: Math.max(batteryIcon.implicitHeight, batteryLabels.implicitHeight)
+
+          Text {
+            id: batteryIcon
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.glyphBattery
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.heading
+          }
+
+          Column {
+            id: batteryLabels
+            anchors.left: batteryIcon.right
+            anchors.leftMargin: Style.space(10)
+            anchors.right: batteryValue.right
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(1)
+
+            Text {
+              text: "Battery"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+            }
+            Text {
+              text: UPower.onBattery ? "Discharging" : "Charging"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          Text {
+            id: batteryValue
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.batteryText
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+          }
+        }
+
+        ButtonGroup {
+          width: parent.width
+          visible: root.profileAvailable
+          foreground: root.foreground
+          accent: root.accent
+          fontFamily: root.fontFamily
+          options: [
+            { value: "power-saver", label: "Saver" },
+            { value: "balanced", label: "Balanced" },
+            { value: "performance", label: "Perf" }
+          ]
+          value: root.powerProfile
+          onChanged: function(v) { root.setPowerProfile(v) }
+        }
+      }
+
+      // ------------------------------------------------------ network page
+      Column {
+        id: networkColumn
+        width: parent.width
+        visible: root.page === "network"
+        spacing: Style.space(12)
+
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(backButton.implicitHeight, netHeaderName.implicitHeight)
+
+          Button {
+            id: backButton
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: root.glyphBack
+            text: "Network"
+            leftAlign: true
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
+            onClicked: root.backToHome()
+          }
+
+          Text {
+            id: netHeaderName
+            anchors.right: parent.right
+            anchors.left: backButton.right
+            anchors.leftMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.netSubtitle
+            horizontalAlignment: Text.AlignRight
+            elide: Text.ElideRight
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        InfoRow {
+          width: parent.width
+          icon: root.netIcon
+          label: "Connection"
+          value: root.netIface !== "" ? root.netIface : root.netSubtitle
+        }
+
+        InfoRow {
+          width: parent.width
+          icon: root.glyphGlobe
+          label: "IP address"
+          value: root.netLocalIp !== "" ? root.netLocalIp : "--"
+          sub: root.netGateway !== "" ? "Gateway " + root.netGateway : ""
+        }
+
+        InfoRow {
+          width: parent.width
+          icon: root.glyphTimer
+          label: "Latency"
+          value: root.netPing !== "" ? root.netPing : "--"
+        }
+
+        InfoRow {
+          width: parent.width
+          icon: root.glyphSpeedometer
+          label: "Link speed"
+          value: root.netLinkSpeed !== "" ? root.netLinkSpeed : "--"
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        BorderSurface {
+          id: speedCard
+          width: parent.width
+          radius: Style.cornerRadius
+          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+          borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+          implicitHeight: speedBody.implicitHeight + Style.space(24)
+
+          Column {
+            id: speedBody
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: Style.space(14)
+            anchors.rightMargin: Style.space(14)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(12)
+
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(downBox.implicitHeight, upBox.implicitHeight)
+
+              Column {
+                id: downBox
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Row {
+                  spacing: Style.space(6)
+
+                  Text {
+                    text: root.glyphDownload
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                  Text {
+                    text: "DOWNLOAD"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+
+                Row {
+                  spacing: Style.space(4)
+
+                  Text {
+                    text: root.speedDownText !== "" ? root.speedDownText : "--"
+                    color: root.speedRunning && root.speedPhase === "down" ? root.accent : root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.display
+                    font.bold: true
+                  }
+                  Text {
+                    text: "Mbps"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    anchors.baseline: parent.baseline
+                  }
+                }
+              }
+
+              Column {
+                id: upBox
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Row {
+                  spacing: Style.space(6)
+
+                  Text {
+                    text: root.glyphUpload
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                  Text {
+                    text: "UPLOAD"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+
+                Row {
+                  spacing: Style.space(4)
+
+                  Text {
+                    text: root.speedUpText !== "" ? root.speedUpText : "--"
+                    color: root.speedRunning && root.speedPhase === "up" ? root.accent : root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.display
+                    font.bold: true
+                  }
+                  Text {
+                    text: "Mbps"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    anchors.baseline: parent.baseline
+                  }
+                }
+              }
+            }
+
+            Button {
+              width: parent.width
+              bordered: true
+              iconText: root.speedRunning ? "" : root.glyphSpeedometer
+              text: root.speedRunning
+                ? "Stop test"
+                : (root.speedHasResult ? "Test again" : "Run speed test")
+              foreground: root.foreground
+              accent: root.accent
+              fontFamily: root.fontFamily
+              onClicked: root.speedRunning ? root.stopSpeedTest() : root.startSpeedTest()
+            }
+
+            Text {
+              width: parent.width
+              visible: root.speedError !== ""
+              text: root.speedError
+              color: Color.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.Wrap
+            }
+          }
+        }
+      }
+
+      // ----------------------------------------------------- bluetooth page
+      Column {
+        id: bluetoothColumn
+        width: parent.width
+        visible: root.page === "bluetooth"
+        spacing: Style.space(12)
+
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(btBackButton.implicitHeight, btHeaderName.implicitHeight)
+
+          Button {
+            id: btBackButton
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: root.glyphBack
+            text: "Bluetooth"
+            leftAlign: true
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
+            onClicked: root.backToHome()
+          }
+
+          Text {
+            id: btHeaderName
+            anchors.right: parent.right
+            anchors.left: btBackButton.right
+            anchors.leftMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.btScanning ? "Scanning…" : root.btSubtitle
+            horizontalAlignment: Text.AlignRight
+            elide: Text.ElideRight
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        ToggleTile {
+          width: parent.width
+          icon: root.btIcon
+          label: "Bluetooth"
+          sub: root.btSubtitle
+          checked: root.btOn
+          showSwitch: root.btAdapter !== null
+          onToggled: root.toggleBluetooth()
+        }
+
+        // The device list is capped and scrolls: a busy room can discover a
+        // dozen devices and the card must not grow past the screen.
+        Flickable {
+          id: btList
+          width: parent.width
+          visible: root.btRowCount > 0
+          height: visible ? Math.min(btListContent.implicitHeight, Style.space(320)) : 0
+          contentHeight: btListContent.implicitHeight
+          clip: true
+          interactive: contentHeight > height
+          boundsBehavior: Flickable.StopAtBounds
+
+          Column {
+            id: btListContent
+            width: parent.width
+            spacing: Style.space(10)
+
+            PanelSectionHeader {
+              visible: root.btConnectedRows.length > 0
+              text: "CONNECTED"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+            Repeater {
+              model: root.btConnectedRows
+              delegate: BtDeviceRow {
+                width: btListContent.width
+                section: "connected"
+              }
+            }
+
+            PanelSectionHeader {
+              visible: root.btKnownRows.length > 0
+              text: "PAIRED"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+            Repeater {
+              model: root.btKnownRows
+              delegate: BtDeviceRow {
+                width: btListContent.width
+                section: "known"
+              }
+            }
+
+            PanelSectionHeader {
+              visible: root.btAvailableRows.length > 0
+              text: "AVAILABLE"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+            Repeater {
+              model: root.btAvailableRows
+              delegate: BtDeviceRow {
+                width: btListContent.width
+                section: "available"
+              }
+            }
+          }
+        }
+
+        Text {
+          width: parent.width
+          visible: root.btAdapter === null || root.btRowCount === 0
+          text: {
+            if (root.btAdapter === null) return "No Bluetooth adapter"
+            if (!root.btOn) return "Turn Bluetooth on to see devices"
+            return "Scanning for nearby devices…"
+          }
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+      }
+
+      // ------------------------------------------------------- display page
+      Column {
+        id: displayColumn
+        width: parent.width
+        visible: root.page === "display"
+        spacing: Style.space(12)
+
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(dispBackButton.implicitHeight, dispHeaderName.implicitHeight)
+
+          Button {
+            id: dispBackButton
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: root.glyphBack
+            text: "Display"
+            leftAlign: true
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
+            onClicked: root.backToHome()
+          }
+
+          Text {
+            id: dispHeaderName
+            anchors.right: parent.right
+            anchors.left: dispBackButton.right
+            anchors.leftMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.displaySubtitle
+            horizontalAlignment: Text.AlignRight
+            elide: Text.ElideRight
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        SliderRow {
+          width: parent.width
+          visible: root.brightness >= 0
+          icon: root.glyphBrightness
+          label: "Brightness"
+          valueText: root.brightness >= 0 ? root.brightness + "%" : "--"
+          value: root.brightness >= 0 ? root.brightness / 100 : 0
+          onMoved: function(v) { root.stageBrightness(v) }
+          onReleased: function(v) { root.commitBrightness(v) }
+        }
+
+        SliderRow {
+          width: parent.width
+          icon: root.glyphDisplay
+          label: "Text size"
+          valueText: root.textSizePx + " px"
+          value: root.textSizeIndex
+          maxValue: root.textSizeStops.length - 1
+          stepSize: 1
+          integerValue: true
+          tickCount: root.textSizeStops.length
+          onMoved: function(v) { root.textSizePreviewIndex = Math.round(v) }
+          onReleased: function(v) { root.setTextSize(root.textSizeStops[Math.round(v)]) }
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        PanelSectionHeader {
+          text: "SCALE"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        ButtonGroup {
+          width: parent.width
+          foreground: root.foreground
+          accent: root.accent
+          fontFamily: root.fontFamily
+          options: root.scaleOptions
+          value: root.currentScaleValue
+          onChanged: function(v) { root.setMonitorScale(v) }
+        }
+
+        PanelSeparator {
+          visible: root.displays.length > 1
+          foreground: root.foreground
+        }
+
+        PanelSectionHeader {
+          visible: root.displays.length > 1
+          text: "DISPLAYS"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        Repeater {
+          model: root.displays
+          delegate: DisplayRow {
+            width: displayColumn.width
+          }
+        }
+      }
+      }
+    }
+  }
+
+  // A clickable tile: icon, label, subtitle and a trailing on/off switch.
+  // By default the whole tile toggles and the switch only mirrors the state.
+  // With `activateOnClick` the body instead emits `activated()` (used to open
+  // a sub-page) while the switch stays interactive and emits `toggled()`.
+  component ToggleTile: BorderSurface {
+    id: tile
+
+    property string icon: ""
+    property string label: ""
+    property string sub: ""
+    property bool checked: false
+    property bool showSwitch: true
+    property bool activateOnClick: false
+    signal toggled()
+    signal activated()
+
+    readonly property bool hot: tileMouse.containsMouse
+    // A board tile wants to read as a card, not as a transparent row: nudge
+    // the resting fill above the shell's 4% row hover and pull it stronger
+    // under the cursor. Both derive from the theme's foreground so they keep
+    // working on light themes.
+    readonly property color restFill: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+    readonly property color hotFill: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+
+    radius: Style.cornerRadius
+    color: hot ? hotFill : restFill
+    borderSpec: Border.controlSpec(hot ? "hover-cursor" : "normal", root.foreground, root.accent)
+    implicitHeight: Math.max(tileBody.implicitHeight + Style.space(18), Style.space(50))
+
+    MouseArea {
+      id: tileMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: tile.activateOnClick ? tile.activated() : tile.toggled()
+    }
+
+    Item {
+      id: tileBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.leftMargin: Style.space(12)
+      anchors.rightMargin: Style.space(12)
+      anchors.verticalCenter: parent.verticalCenter
+      implicitHeight: Math.max(tileIcon.implicitHeight, tileLabels.implicitHeight, tileSwitch.implicitHeight)
+
+      Text {
+        id: tileIcon
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        text: tile.icon
+        color: tile.checked ? root.foreground : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.heading
+      }
+
+      Column {
+        id: tileLabels
+        anchors.left: tileIcon.right
+        anchors.leftMargin: Style.space(10)
+        anchors.right: tileSwitch.visible ? tileSwitch.left : parent.right
+        anchors.rightMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(1)
+
+        Text {
+          text: tile.label
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+          width: parent.width
+        }
+        Text {
+          text: tile.sub
+          visible: text !== ""
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+          width: parent.width
+        }
+      }
+
+      ToggleSwitch {
+        id: tileSwitch
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        visible: tile.showSwitch
+        checked: tile.checked
+        interactive: tile.activateOnClick
+        foreground: root.foreground
+        accent: root.accent
+        onToggled: tile.toggled()
+      }
+    }
+  }
+
+  // A labelled row with a slider underneath. The label row carries an icon,
+  // title, optional subtitle and a right-aligned value; the slider spans the
+  // full width so it is comfortable to grab.
+  component SliderRow: Item {
+    id: row
+
+    property string icon: ""
+    property string label: ""
+    property string sub: ""
+    property string valueText: ""
+    property real value: 0
+    // Defaults suit the 0..1 volume/brightness sliders; the Display page's
+    // text-size row overrides them for its discrete stops.
+    property real maxValue: 1
+    property real stepSize: 0.02
+    property bool integerValue: false
+    property int tickCount: 0
+    signal moved(real v)
+    signal released(real v)
+    signal secondary()
+
+    implicitHeight: sliderBody.implicitHeight
+
+    Column {
+      id: sliderBody
+      width: parent.width
+      spacing: Style.space(6)
+
+      Item {
+        width: parent.width
+        implicitHeight: Math.max(rowIcon.implicitHeight, rowLabels.implicitHeight, rowValue.implicitHeight)
+
+        Text {
+          id: rowIcon
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          text: row.icon
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.heading
+        }
+
+        Column {
+          id: rowLabels
+          anchors.left: rowIcon.right
+          anchors.leftMargin: Style.space(10)
+          anchors.right: rowValue.left
+          anchors.rightMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(1)
+
+          Text {
+            text: row.label
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+            width: parent.width
+          }
+          Text {
+            text: row.sub
+            visible: text !== ""
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+            width: parent.width
+          }
+        }
+
+        Text {
+          id: rowValue
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          text: row.valueText
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          font.bold: true
+        }
+      }
+
+      PanelSlider {
+        width: parent.width
+        bar: root.bar
+        value: row.value
+        minimum: 0
+        maximum: row.maxValue
+        step: row.stepSize
+        integer: row.integerValue
+        tickCount: row.tickCount
+        onMoved: function(v) { row.moved(v) }
+        onReleased: function(v) { row.released(v) }
+        onRightClicked: row.secondary()
+      }
+    }
+  }
+
+  // A read-only detail row: icon, title (with optional subtitle) and a
+  // right-aligned value. Used by the Network page.
+  component InfoRow: Item {
+    id: info
+
+    property string icon: ""
+    property string label: ""
+    property string value: ""
+    property string sub: ""
+
+    implicitHeight: Math.max(infoIcon.implicitHeight, infoLabels.implicitHeight, infoValue.implicitHeight)
+
+    Text {
+      id: infoIcon
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      text: info.icon
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.heading
+    }
+
+    Column {
+      id: infoLabels
+      anchors.left: infoIcon.right
+      anchors.leftMargin: Style.space(10)
+      anchors.right: infoValue.left
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(1)
+
+      Text {
+        text: info.label
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        elide: Text.ElideRight
+        width: parent.width
+      }
+      Text {
+        text: info.sub
+        visible: text !== ""
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+        width: parent.width
+      }
+    }
+
+    Text {
+      id: infoValue
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      text: info.value
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      font.bold: true
+    }
+  }
+
+  // A Bluetooth device row: icon, name and a status line that also shows the
+  // optimistic pending action. Left click connects/disconnects/pairs, right
+  // click forgets a remembered device.
+  component BtDeviceRow: BorderSurface {
+    id: btRow
+
+    required property var modelData
+    required property string section
+
+    readonly property var row: btRow.modelData
+    readonly property bool hot: btRowMouse.containsMouse
+    readonly property bool connected: row ? row.connected === true : false
+    readonly property string pending: root.btPendingAction(row ? row.address : "")
+    readonly property string status: {
+      if (!row) return ""
+      if (pending === "forgetting") return "Forgetting…"
+      if (pending === "disconnecting") return "Disconnecting…"
+      if (pending === "connecting") return "Connecting…"
+      if (connected) return row.batteryAvailable ? Math.round(row.battery * 100) + "%" : "Connected"
+      if (section === "available") return "Tap to pair"
+      return "Tap to connect"
+    }
+
+    readonly property color restFill: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+    readonly property color hotFill: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+
+    radius: Style.cornerRadius
+    color: hot ? hotFill : restFill
+    borderSpec: Border.controlSpec(hot ? "hover-cursor" : "normal", root.foreground, root.accent)
+    implicitHeight: Math.max(btRowBody.implicitHeight + Style.space(18), Style.space(50))
+
+    MouseArea {
+      id: btRowMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      acceptedButtons: Qt.LeftButton | Qt.RightButton
+      cursorShape: Qt.PointingHandCursor
+      onClicked: function(mouse) {
+        if (mouse.button === Qt.RightButton) root.btSecondary(btRow.row, btRow.section)
+        else root.btActivate(btRow.row)
+      }
+      onPressAndHold: root.btSecondary(btRow.row, btRow.section)
+    }
+
+    Item {
+      id: btRowBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.leftMargin: Style.space(12)
+      anchors.rightMargin: Style.space(12)
+      anchors.verticalCenter: parent.verticalCenter
+      implicitHeight: Math.max(btRowIcon.implicitHeight, btRowLabels.implicitHeight)
+
+      Text {
+        id: btRowIcon
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        text: btRow.connected ? root.glyphBtConnected : root.glyphBtOn
+        color: btRow.connected ? root.foreground : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.heading
+      }
+
+      Column {
+        id: btRowLabels
+        anchors.left: btRowIcon.right
+        anchors.leftMargin: Style.space(10)
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(1)
+
+        Text {
+          width: parent.width
+          text: btRow.row ? btRow.row.label : ""
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+        }
+        Text {
+          width: parent.width
+          text: btRow.status
+          color: btRow.connected ? root.foreground : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+    }
+  }
+
+  // A full-width card that opens a sub-page: icon, title, optional subtitle and
+  // a trailing chevron. Used as the Display section's entry point.
+  component OpenRow: BorderSurface {
+    id: openRow
+
+    property string icon: ""
+    property string label: ""
+    property string sub: ""
+    signal clicked()
+
+    readonly property bool hot: openMouse.containsMouse
+    readonly property color restFill: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+    readonly property color hotFill: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+
+    radius: Style.cornerRadius
+    color: hot ? hotFill : restFill
+    borderSpec: Border.controlSpec(hot ? "hover-cursor" : "normal", root.foreground, root.accent)
+    implicitHeight: Math.max(openBody.implicitHeight + Style.space(18), Style.space(50))
+
+    MouseArea {
+      id: openMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: openRow.clicked()
+    }
+
+    Item {
+      id: openBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.leftMargin: Style.space(12)
+      anchors.rightMargin: Style.space(12)
+      anchors.verticalCenter: parent.verticalCenter
+      implicitHeight: Math.max(openIcon.implicitHeight, openLabels.implicitHeight, openChevron.implicitHeight)
+
+      Text {
+        id: openIcon
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        text: openRow.icon
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.heading
+      }
+
+      Column {
+        id: openLabels
+        anchors.left: openIcon.right
+        anchors.leftMargin: Style.space(10)
+        anchors.right: openChevron.left
+        anchors.rightMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(1)
+
+        Text {
+          width: parent.width
+          text: openRow.label
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+        }
+        Text {
+          width: parent.width
+          visible: text !== ""
+          text: openRow.sub
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+
+      Text {
+        id: openChevron
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.glyphForward
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+    }
+  }
+
+  // A monitor row on the Display page: icon, name (marked when focused) and a
+  // check when enabled. Click toggles the monitor, unless it is the last one on.
+  component DisplayRow: BorderSurface {
+    id: displayRow
+
+    required property var modelData
+    readonly property var display: displayRow.modelData
+    readonly property bool canToggle: display && (!display.enabled || root.enabledDisplayCount > 1)
+    readonly property bool hot: displayMouse.containsMouse && canToggle
+
+    readonly property color restFill: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+    readonly property color hotFill: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+
+    radius: Style.cornerRadius
+    color: hot ? hotFill : restFill
+    borderSpec: Border.controlSpec(hot ? "hover-cursor" : "normal", root.foreground, root.accent)
+    opacity: canToggle ? 1 : 0.45
+    implicitHeight: Math.max(displayBody.implicitHeight + Style.space(18), Style.space(50))
+
+    MouseArea {
+      id: displayMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: displayRow.canToggle ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onClicked: if (displayRow.canToggle) root.toggleDisplay(displayRow.display.name, displayRow.display.enabled)
+    }
+
+    Item {
+      id: displayBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.leftMargin: Style.space(12)
+      anchors.rightMargin: Style.space(12)
+      anchors.verticalCenter: parent.verticalCenter
+      implicitHeight: Math.max(displayIcon.implicitHeight, displayLabels.implicitHeight, displayCheck.implicitHeight)
+
+      Text {
+        id: displayIcon
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.glyphDisplay
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.heading
+      }
+
+      Column {
+        id: displayLabels
+        anchors.left: displayIcon.right
+        anchors.leftMargin: Style.space(10)
+        anchors.right: displayCheck.left
+        anchors.rightMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(1)
+
+        Text {
+          width: parent.width
+          text: {
+            if (!displayRow.display) return ""
+            return displayRow.display.name + (displayRow.display.focused ? " · focused" : "")
+          }
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+        }
+        Text {
+          width: parent.width
+          visible: text !== ""
+          text: {
+            if (!displayRow.display) return ""
+            return Math.round(displayRow.display.width) + "×" + Math.round(displayRow.display.height)
+          }
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+
+      Text {
+        id: displayCheck
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: displayRow.display && displayRow.display.enabled ? "󰄬" : ""
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+    }
+  }
+}
