@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Effects
 import Quickshell
 import Quickshell.Io
 import Quickshell.Networking
@@ -63,6 +64,7 @@ Panel {
   readonly property string glyphTimer: "󰔟"
   readonly property string glyphDownload: "󰇚"
   readonly property string glyphUpload: "󰕒"
+  readonly property string glyphTheme: "󰏘"
 
   // ------------------------------------------------------------ live state
   readonly property var netDevices: Networking.devices ? Networking.devices.values : []
@@ -116,6 +118,13 @@ Panel {
   property bool profileAvailable: false
   property string hostname: ""
   property string themeName: ""
+
+  // Themes page state: installed themes (slug + preview image path) read from
+  // the theme directories, the slug currently highlighted for preview, and
+  // whether a switch is in flight.
+  property var themeRows: []
+  property string themeSelected: ""
+  property bool themeSetting: false
 
   // ------------------------------------------------- network detail sub-page
   // "home" | "network" | "bluetooth" | "display". A tile body (or the Display
@@ -186,6 +195,27 @@ Panel {
     if (btConnectedCount === 0) return "On"
     return btConnectedCount === 1 ? "1 device" : btConnectedCount + " devices"
   }
+
+  // ------------------------------------------------------------ theme derived
+  // The current theme's slug (e.g. "Tokyo Night" -> "tokyo-night") is how the
+  // theme directories and the list rows are keyed.
+  readonly property string currentThemeSlug: themeName !== "" ? themeName.toLowerCase().replace(/ /g, "-") : ""
+  // The row to preview: the explicit pick, else the active theme, else the
+  // first installed theme once the list has loaded.
+  readonly property string themeEffectiveSlug: {
+    if (themeSelected !== "") return themeSelected
+    if (currentThemeSlug !== "") return currentThemeSlug
+    return themeRows.length > 0 ? themeRows[0].slug : ""
+  }
+  readonly property string themeSelectedName: {
+    var row = themeSelectedRow()
+    return row ? row.name : ""
+  }
+  readonly property string themePreviewSource: {
+    var row = themeSelectedRow()
+    return row && row.preview !== "" ? "file://" + row.preview : ""
+  }
+  readonly property bool themeIsCurrent: themeEffectiveSlug !== "" && themeEffectiveSlug === currentThemeSlug
 
   // ------------------------------------------------- network page derived
   readonly property string netLocalIp: String(netDetail.ip || "")
@@ -308,6 +338,10 @@ Panel {
     if (page === "network") {
       netDetailProc.running = true
       dnsGetProc.running = true
+    }
+    if (page === "themes") {
+      themeListProc.running = true
+      themeProc.running = true
     }
   }
 
@@ -577,6 +611,60 @@ Panel {
     btOwnsDiscovery = false
   }
 
+  // ------------------------------------------------------------ theme actions
+  // Title-case a slug the same way the omarchy helpers do: "tokyo-night" ->
+  // "Tokyo Night". The slug is the key the theme directories use.
+  function themeDisplayName(slug) {
+    var parts = String(slug || "").split("-")
+    var out = []
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i] === "") continue
+      out.push(parts[i].charAt(0).toUpperCase() + parts[i].slice(1))
+    }
+    return out.join(" ")
+  }
+
+  function openThemePage() {
+    page = "themes"
+    themeSelected = currentThemeSlug
+    themeListProc.running = true
+    themeProc.running = true
+  }
+
+  function updateThemes(output) {
+    var lines = String(output || "").split("\n")
+    var rows = []
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i].trim() === "") continue
+      var parts = lines[i].split("\t")
+      var slug = String(parts[0] || "").trim()
+      if (slug === "") continue
+      rows.push({ slug: slug, name: themeDisplayName(slug), preview: String(parts[1] || "").trim() })
+    }
+    rows.sort(function(a, b) { return a.name.localeCompare(b.name) })
+    themeRows = rows
+    if (themeSelected === "") themeSelected = currentThemeSlug
+  }
+
+  function themeSelectedRow() {
+    for (var i = 0; i < themeRows.length; i++)
+      if (themeRows[i].slug === themeEffectiveSlug) return themeRows[i]
+    return null
+  }
+
+  function selectTheme(slug) {
+    themeSelected = String(slug || "")
+  }
+
+  function applyTheme() {
+    if (themeSetting) return
+    var row = themeSelectedRow()
+    if (!row || row.slug === currentThemeSlug) return
+    themeSetting = true
+    themeSetProc.command = ["omarchy-theme-set", row.name]
+    themeSetProc.running = true
+  }
+
   // ---------------------------------------------------------- display actions
   function openDisplayPage() {
     page = "display"
@@ -695,6 +783,30 @@ Panel {
   // one (two overlapping ddcutil calls on the same bus fail silently).
   property bool brightnessSetQueued: false
 
+  // Lists the installed themes as "<slug>\t<preview-path>" lines. User themes
+  // win over shipped ones on a slug clash; a theme without preview.png falls
+  // back to its first background so the row still has a thumbnail.
+  readonly property string themeListScript: [
+    "declare -A seen",
+    "for d in \"$HOME/.config/omarchy/themes\" \"${OMARCHY_PATH:-/usr/share/omarchy}/themes\"; do",
+    "  [ -d \"$d\" ] || continue",
+    "  for p in \"$d\"/*; do",
+    "    [ -d \"$p\" ] || continue",
+    "    s=${p##*/}",
+    "    [ -n \"${seen[$s]:-}\" ] && continue",
+    "    seen[$s]=1",
+    "    v=\"\"",
+    "    for f in preview.png preview.jpg preview.jpeg preview.webp preview.gif preview.bmp; do",
+    "      if [ -f \"$p/$f\" ]; then v=\"$p/$f\"; break; fi",
+    "    done",
+    "    if [ -z \"$v\" ] && [ -d \"$p/backgrounds\" ]; then",
+    "      v=$(find -L \"$p/backgrounds\" -maxdepth 1 -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \\) | sort | head -n1)",
+    "    fi",
+    "    printf '%s\\t%s\\n' \"$s\" \"$v\"",
+    "  done",
+    "done"
+  ].join("\n")
+
   // -------------------------------------------------------------- processes
   Process {
     id: netProc
@@ -807,6 +919,27 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.themeName = String(text || "").trim()
+    }
+  }
+
+  Process {
+    id: themeListProc
+    command: ["bash", "-c", root.themeListScript]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.updateThemes(text)
+    }
+  }
+
+  // Applying a theme is heavy: Omarchy runs its theme hooks and repaints the
+  // whole desktop, so it only starts from the explicit "Set theme" button.
+  Process {
+    id: themeSetProc
+    onExited: function(code) {
+      root.themeSetting = false
+      // Re-read the current theme so the check mark follows the applied theme.
+      themeProc.running = true
+      themeListProc.running = true
     }
   }
 
@@ -1031,6 +1164,7 @@ Panel {
         implicitHeight: root.page === "network" ? networkColumn.implicitHeight
                       : root.page === "bluetooth" ? bluetoothColumn.implicitHeight
                       : root.page === "display" ? displayColumn.implicitHeight
+                      : root.page === "themes" ? themesColumn.implicitHeight
                       : column.implicitHeight
 
       Column {
@@ -1158,6 +1292,22 @@ Panel {
           onMoved: function(v) { root.setVolume(v) }
           onReleased: function(v) { root.setVolume(v) }
           onSecondary: root.toggleMute()
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        PanelSectionHeader {
+          text: "THEMES"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        OpenRow {
+          width: parent.width
+          icon: root.glyphTheme
+          label: "Change theme"
+          sub: root.themeName
+          onClicked: root.openThemePage()
         }
 
         PanelSeparator {
@@ -1698,6 +1848,154 @@ Panel {
           }
         }
       }
+
+      Column {
+        id: themesColumn
+        width: parent.width
+        visible: root.page === "themes"
+        spacing: Style.space(12)
+
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(themeBackButton.implicitHeight, themeHeaderName.implicitHeight)
+
+          Button {
+            id: themeBackButton
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: root.glyphBack
+            text: "Themes"
+            leftAlign: true
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
+            onClicked: root.backToHome()
+          }
+
+          Text {
+            id: themeHeaderName
+            anchors.right: parent.right
+            anchors.left: themeBackButton.right
+            anchors.leftMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.themeName
+            horizontalAlignment: Text.AlignRight
+            elide: Text.ElideRight
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        // The highlighted theme's preview, shown before the switch is committed.
+        BorderSurface {
+          width: parent.width
+          visible: root.themePreviewSource !== ""
+          radius: Style.cornerRadius
+          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+          borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+          implicitHeight: Math.round(width * 9 / 16) + Style.space(12)
+
+          Item {
+            id: themePreviewImage
+            anchors.fill: parent
+            anchors.margins: Style.space(6)
+            layer.enabled: true
+            layer.effect: MultiEffect {
+              maskEnabled: true
+              maskSource: themePreviewMask
+            }
+
+            Image {
+              anchors.fill: parent
+              source: root.themePreviewSource
+              fillMode: Image.PreserveAspectCrop
+              asynchronous: true
+              cache: true
+              sourceSize.width: 720
+            }
+          }
+
+          Item {
+            id: themePreviewMask
+            anchors.fill: themePreviewImage
+            visible: false
+            layer.enabled: true
+
+            Rectangle {
+              anchors.fill: parent
+              radius: Style.space(8)
+              color: "white"
+            }
+          }
+        }
+
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(themeSelectedLabel.implicitHeight, themeApplyButton.implicitHeight, Style.space(32))
+
+          Text {
+            id: themeSelectedLabel
+            anchors.left: parent.left
+            anchors.right: themeApplyButton.left
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.themeSelectedName !== "" ? root.themeSelectedName : "Select a theme"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+          }
+
+          Button {
+            id: themeApplyButton
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.themeIsCurrent ? "Current theme" : (root.themeSetting ? "Applying…" : "Set theme")
+            enabled: !root.themeIsCurrent && !root.themeSetting && root.themeSelected !== ""
+            opacity: enabled ? 1 : 0.5
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
+            onClicked: root.applyTheme()
+          }
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        PanelSectionHeader {
+          text: "INSTALLED"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        // A machine can install a couple dozen themes; cap the list and let it
+        // scroll like the Bluetooth device list so the card never grows past
+        // the screen.
+        Flickable {
+          id: themeList
+          width: parent.width
+          visible: root.themeRows.length > 0
+          height: visible ? Math.min(themeListContent.implicitHeight, Style.space(320)) : 0
+          contentHeight: themeListContent.implicitHeight
+          clip: true
+          interactive: contentHeight > height
+          boundsBehavior: Flickable.StopAtBounds
+
+          Column {
+            id: themeListContent
+            width: parent.width
+            spacing: Style.space(6)
+
+            Repeater {
+              model: root.themeRows
+              delegate: ThemeRow {
+                width: themeListContent.width
+              }
+            }
+          }
+        }
+      }
       }
     }
   }
@@ -2222,6 +2520,105 @@ Panel {
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
         text: displayRow.display && displayRow.display.enabled ? "󰄬" : ""
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+    }
+  }
+
+  // A theme row on the Themes page: a rounded preview thumbnail, the name and a
+  // check on the active theme. Clicking highlights the theme for preview; the
+  // switch itself is committed from the "Set theme" button above the list.
+  component ThemeRow: BorderSurface {
+    id: themeRow
+
+    required property var modelData
+    readonly property var entry: themeRow.modelData
+    readonly property bool selected: entry !== null && entry.slug === root.themeEffectiveSlug
+    readonly property bool current: entry !== null && entry.slug === root.currentThemeSlug
+    readonly property bool hot: themeRowMouse.containsMouse
+
+    readonly property color restFill: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+    readonly property color hotFill: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+    readonly property color selectedFill: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.16)
+
+    radius: Style.cornerRadius
+    color: selected ? selectedFill : (hot ? hotFill : restFill)
+    borderSpec: Border.controlSpec(selected ? "selected" : (hot ? "hover-cursor" : "normal"), root.foreground, root.accent)
+    implicitHeight: Math.max(themeRowBody.implicitHeight + Style.space(12), Style.space(52))
+
+    MouseArea {
+      id: themeRowMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: if (themeRow.entry !== null) root.selectTheme(themeRow.entry.slug)
+    }
+
+    Item {
+      id: themeRowBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(12)
+      anchors.verticalCenter: parent.verticalCenter
+      implicitHeight: Math.max(themeRowThumb.height, themeRowName.implicitHeight, themeRowCheck.implicitHeight)
+
+      Item {
+        id: themeRowThumb
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        width: Style.space(60)
+        height: Style.space(34)
+        layer.enabled: true
+        layer.effect: MultiEffect {
+          maskEnabled: true
+          maskSource: themeRowMask
+        }
+
+        Image {
+          anchors.fill: parent
+          source: themeRow.entry !== null && themeRow.entry.preview !== "" ? "file://" + themeRow.entry.preview : ""
+          fillMode: Image.PreserveAspectCrop
+          asynchronous: true
+          cache: true
+          sourceSize.width: 160
+        }
+      }
+
+      Item {
+        id: themeRowMask
+        anchors.fill: themeRowThumb
+        visible: false
+        layer.enabled: true
+
+        Rectangle {
+          anchors.fill: parent
+          radius: Style.space(5)
+          color: "white"
+        }
+      }
+
+      Text {
+        id: themeRowName
+        anchors.left: themeRowThumb.right
+        anchors.leftMargin: Style.space(10)
+        anchors.right: themeRowCheck.left
+        anchors.rightMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        text: themeRow.entry !== null ? themeRow.entry.name : ""
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        elide: Text.ElideRight
+      }
+
+      Text {
+        id: themeRowCheck
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: themeRow.current ? "󰄬" : ""
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body

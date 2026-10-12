@@ -5,6 +5,30 @@ to its bar button with a grid of quick toggles and sliders, so the things you
 reach for most often are one click away instead of spread across the individual
 audio / network / bluetooth / power panels.
 
+<p align="center">
+  <img src="preview.png" alt="Control Panel preview" width="420">
+</p>
+
+## Install
+
+Add the plugin from the repository and enable it in the bar:
+
+```bash
+omarchy plugin add https://github.com/archlatam/oma.controlcenter.git --enable
+```
+
+## Update
+
+```bash
+omarchy plugin update oma.controlpanel
+```
+
+## Remove
+
+```bash
+omarchy plugin remove oma.controlpanel
+```
+
 ## What's in the panel
 
 | Section | Control |
@@ -15,6 +39,7 @@ audio / network / bluetooth / power panels.
 | Quick | **Do Not Disturb** — on/off |
 | Audio | Output volume slider + right-click to mute |
 | Display | Brightness slider; click the **Display** row to open the [Display detail page](#display-detail-page) |
+| Themes | Click the **Change theme** row to open the [Themes page](#themes-page) |
 | Power | Battery level/state + AC/Battery power profile (when available) |
 
 The panel refreshes its polled state (connection name, brightness, night light,
@@ -84,6 +109,23 @@ The built-in `omarchy.monitor` panel toggles monitors with `hyprctl keyword
 monitor`, which Hyprland 0.56's new parser rejects; this page uses `hyprctl eval
 "hl.monitor(...)"` instead, the same call Omarchy's own scaling helper uses.
 
+### Themes page
+
+Clicking the **Change theme** row under the THEMES section opens a page with a
+back button or `Esc` to return:
+
+| Control | Source |
+|---------|--------|
+| Preview | the highlighted theme's `preview.png` (or its first background) |
+| Installed list | theme directories under `~/.config/omarchy/themes` and `$OMARCHY_PATH/themes`, with a thumbnail per theme |
+| **Set theme** | `omarchy-theme-set` |
+
+Selecting a theme highlights it and shows its preview; the switch is only
+committed from the **Set theme** button, because applying a theme runs Omarchy's
+theme hooks and repaints the whole desktop. The current theme is marked with a
+check, and the button reads **Current theme** when the highlighted theme is
+already active.
+
 ## Dependencies
 
 Only standard Omarchy tooling, all present on a stock install:
@@ -97,6 +139,8 @@ Only standard Omarchy tooling, all present on a stock install:
 - `omarchy-display-text-size` (text size)
 - `omarchy-hyprland-monitor-scaling` (monitor scale)
 - `hyprctl` (`eval hl.monitor`) (enable / disable outputs)
+- `omarchy-theme-current` (active theme name)
+- `omarchy-theme-set` (Themes page: switch theme)
 - `omarchy-toggle-nightlight`
 - `omarchy-brightness-display`
 - `omarchy-shell notifications` (DND state / toggle)
