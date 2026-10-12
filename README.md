@@ -1,6 +1,6 @@
 # Control Panel (`oma.controlpanel`)
 
-A Dank-Material-style **control center** for the Omarchy bar: a popup anchored
+A **control center** for the Omarchy bar: a popup anchored
 to its bar button with a grid of quick toggles and sliders, so the things you
 reach for most often are one click away instead of spread across the individual
 audio / network / bluetooth / power panels.
@@ -14,7 +14,7 @@ audio / network / bluetooth / power panels.
 | Quick | **Night Light** — on/off |
 | Quick | **Do Not Disturb** — on/off |
 | Audio | Output volume slider + right-click to mute |
-| Display | Brightness slider |
+| Display | Brightness slider; click the **Display** row to open the [Display detail page](#display-detail-page) |
 | Power | Battery level/state + AC/Battery power profile (when available) |
 
 The panel refreshes its polled state (connection name, brightness, night light,
@@ -34,7 +34,13 @@ toggles Wi-Fi) opens a detail page inside the same popup, with a back button or
 | IP address + gateway | `omarchy-network-status --verbose` |
 | Latency | `internet_ping_ms` |
 | Link speed | negotiated link rate |
+| **DNS provider** | `omarchy-dns` (DHCP / Cloudflare / Google / Custom) |
 | **Speed test** | `omarchy-network-speedtest down\|up` |
+
+The **DNS provider** row is a group of pills that mirrors the built-in
+`omarchy.network` panel. Selecting one rewrites the system resolver through
+`omarchy-dns` (it uses the passwordless `omarchy-dns` sudoers rule, or polkit as
+a fallback); **Custom** opens a floating terminal to type the servers.
 
 The **Run speed test** button measures download for a few seconds, then upload,
 showing live Mbps (the same engine the built-in `omarchy.speedtest` uses). It
@@ -60,28 +66,23 @@ when the page opens and stops when you leave it or close the panel, so the
 radio is not held scanning in the background. Actions go through
 `omarchy-bluetooth-device`, matching the built-in Bluetooth panel.
 
+### Display detail page
 
-## Install (manual)
+Clicking the **Display** row under the DISPLAY section opens a detail page with
+a back button or `Esc` to return:
 
-```bash
-mkdir -p ~/.config/omarchy/plugins
-cp -r oma.controlpanel ~/.config/omarchy/plugins/
-omarchy-shell shell rescanPlugins
-omarchy plugin enable oma.controlpanel
-```
+| Control | Source |
+|---------|--------|
+| Brightness | `omarchy-brightness-display`; hidden when there is no controllable backlight |
+| Text size | `omarchy-display-text-size`; snaps to the 9–20 px stops |
+| Scale | `omarchy-hyprland-monitor-scaling`; 1x … 4x, filtered to the scales the focused monitor supports |
+| Displays | `hyprctl` (`hl.monitor`); enable/disable each output, shown only with more than one monitor |
 
-Add it to the bar and place it (the manifest asks for the right section by
-default):
+The Displays list never lets you disable the last enabled output.
 
-```bash
-omarchy bar move oma.controlpanel --section right
-```
-
-Open it from the bar button (glyph 󰕮), or bind a key to the IPC route:
-
-```bash
-omarchy-shell oma.controlpanel toggle
-```
+The built-in `omarchy.monitor` panel toggles monitors with `hyprctl keyword
+monitor`, which Hyprland 0.56's new parser rejects; this page uses `hyprctl eval
+"hl.monitor(...)"` instead, the same call Omarchy's own scaling helper uses.
 
 ## Dependencies
 
@@ -89,8 +90,13 @@ Only standard Omarchy tooling, all present on a stock install:
 
 - `omarchy-network-status`
 - `omarchy-network-speedtest` (for the Network detail page's speed test)
+- `omarchy-dns` (Network detail page: provider pills)
 - `omarchy-bluetooth-power`
 - `omarchy-bluetooth-device` (connect / disconnect / pair / forget)
+- `omarchy-monitor-state` (Display detail page: focused monitor, scale, outputs)
+- `omarchy-display-text-size` (text size)
+- `omarchy-hyprland-monitor-scaling` (monitor scale)
+- `hyprctl` (`eval hl.monitor`) (enable / disable outputs)
 - `omarchy-toggle-nightlight`
 - `omarchy-brightness-display`
 - `omarchy-shell notifications` (DND state / toggle)

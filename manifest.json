@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "archlatam",
   "license": "MIT",
-  "description": "A Dank-style control center for the Omarchy bar: quick toggles and sliders for network, Bluetooth, audio, brightness, night light, power and notifications.",
+  "description": "A control center for the Omarchy bar: quick toggles and sliders for network, Bluetooth, audio, brightness, night light, power and notifications.",
   "homepage": "https://github.com/archlatam",
   "kinds": [
     "bar-widget"

@@ -8,7 +8,7 @@ import Quickshell.Services.UPower
 import qs.Commons
 import qs.Ui
 
-// oma.controlpanel — a Dank-Material-style control center for the Omarchy bar.
+// oma.controlpanel — a control center for the Omarchy bar.
 //
 // A popup anchored to the bar button: a hero, a grid of quick toggles
 // (network, Bluetooth, night light, do-not-disturb), the audio and brightness
@@ -74,6 +74,10 @@ Panel {
   readonly property bool wifiOn: Networking.wifiEnabled
   // { type, name } from `omarchy-network-status`; empty until the first poll.
   property var netInfo: ({})
+  // System DNS provider from `omarchy-dns`; the Network page's pills write it.
+  property string dnsProvider: "DHCP"
+  property string dnsPending: ""
+  readonly property var dnsProviders: ["DHCP", "Cloudflare", "Google", "Custom"]
 
   readonly property var btAdapter: Bluetooth.defaultAdapter
   readonly property bool btOn: btAdapter !== null && btAdapter.enabled
@@ -111,6 +115,7 @@ Panel {
   property string powerProfile: ""
   property bool profileAvailable: false
   property string hostname: ""
+  property string themeName: ""
 
   // ------------------------------------------------- network detail sub-page
   // "home" | "network" | "bluetooth" | "display". A tile body (or the Display
@@ -291,13 +296,19 @@ Panel {
   // -------------------------------------------------------------- actions
   function refresh() {
     netProc.running = true
-    brightnessGetProc.running = true
     nightlightGetProc.running = true
     dndGetProc.running = true
     profileGetProc.running = true
     hostProc.running = true
-    monitorStateProc.running = true
-    if (page === "network") netDetailProc.running = true
+    themeProc.running = true
+    // monitorStateProc also carries the brightness read. Skip it while a set is
+    // in flight: two DDC/CI calls at once make the write fail on external
+    // monitors.
+    if (!brightnessSetProc.running && !brightnessDebounce.running) monitorStateProc.running = true
+    if (page === "network") {
+      netDetailProc.running = true
+      dnsGetProc.running = true
+    }
   }
 
   function openFromHotkey() {
@@ -366,7 +377,12 @@ Panel {
   function applyBrightness() {
     // Optimistic: the slider should not snap back while the helper runs.
     brightness = brightnessPending
-    Quickshell.execDetached(["omarchy-brightness-display", "--no-osd", brightnessPending + "%"])
+    if (brightnessSetProc.running) {
+      brightnessSetQueued = true
+      return
+    }
+    brightnessSetQueued = false
+    brightnessSetProc.running = true
   }
 
   function setPowerProfile(p) {
@@ -381,6 +397,25 @@ Panel {
     stopBtDiscovery()
     page = "network"
     netDetailProc.running = true
+    dnsGetProc.running = true
+  }
+
+  function updateDns(raw) {
+    var v = String(raw || "").trim()
+    dnsProvider = v !== "" ? v : "DHCP"
+  }
+
+  function setDns(provider) {
+    if (!provider || dnsSetProc.running) return
+    if (provider === "Custom") {
+      // Custom prompts for the servers, so it needs a terminal.
+      Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", "omarchy-dns Custom"])
+      return
+    }
+    dnsPending = provider
+    dnsProvider = provider // optimistic; the re-read on exit reverts on failure
+    dnsSetProc.command = ["omarchy-dns", provider]
+    dnsSetProc.running = true
   }
 
   function backToHome() {
@@ -656,6 +691,9 @@ Panel {
   }
 
   property int brightnessPending: 50
+  // DDC/CI reads are slow, so a set gets queued instead of racing the in-flight
+  // one (two overlapping ddcutil calls on the same bus fail silently).
+  property bool brightnessSetQueued: false
 
   // -------------------------------------------------------------- processes
   Process {
@@ -690,18 +728,25 @@ Panel {
     }
   }
 
+  // `omarchy-dns` with no argument prints the active provider (DHCP,
+  // Cloudflare, Google or Custom); with one it rewrites NetworkManager's
+  // config. The write needs privileges, so the helper shells out to sudo.
   Process {
-    id: brightnessGetProc
-    command: ["omarchy-brightness-display"]
+    id: dnsGetProc
+    command: ["omarchy-dns"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: {
-        var m = String(text || "").match(/\d+/)
-        if (m) {
-          root.brightness = parseInt(m[0], 10)
-          root.brightnessPending = root.brightness
-        }
-      }
+      onStreamFinished: root.updateDns(text)
+    }
+  }
+
+  Process {
+    id: dnsSetProc
+    onExited: function(code) {
+      root.dnsPending = ""
+      // The helper rewrote the resolver config; re-read the effective provider
+      // so a failed write rolls the highlighted pill back.
+      dnsGetProc.running = true
     }
   }
 
@@ -754,6 +799,17 @@ Panel {
     }
   }
 
+  // Human-readable name of the active theme (e.g. "Tokyo Night"), shown as the
+  // hero's second line. Cheap: the helper only title-cases a state file.
+  Process {
+    id: themeProc
+    command: ["omarchy-theme-current"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.themeName = String(text || "").trim()
+    }
+  }
+
   // `omarchy-monitor-state` prints eight lines: brightness, internal monitor,
   // external monitor, internal-enabled, mirror, focused monitor, scale, and a
   // JSON array of displays (name/enabled/focused/width/height).
@@ -764,9 +820,37 @@ Panel {
       waitForEnd: true
       onStreamFinished: {
         var lines = String(text || "").split("\n")
+        // Line 0 is the focused display's brightness. This is the only
+        // brightness read: the helper shares one slow DDC/CI call, so issuing
+        // it twice per refresh (or during a set) makes the writes fail.
+        var b = String(lines[0] || "").trim()
+        if (!brightnessSetProc.running && b !== "" && b !== "unavailable") {
+          var n = parseInt(b, 10)
+          if (isFinite(n)) {
+            root.brightness = Math.max(0, Math.min(100, n))
+            root.brightnessPending = root.brightness
+          }
+        }
         root.focusedMonitor = String(lines[5] || "").trim()
         root.monitorScale = root.normalizeScale(String(lines[6] || "").trim())
         root.updateDisplays(String(lines[7] || "[]").trim())
+      }
+    }
+  }
+
+  Process {
+    id: brightnessSetProc
+    // Pass the monitor explicitly (like the built-in panel) so the helper skips
+    // its own focused-monitor lookup. Falls back internally when empty.
+    command: ["omarchy-brightness-display", "--no-osd", "--monitor", root.focusedMonitor, root.brightnessPending + "%"]
+    onRunningChanged: {
+      if (running) return
+      if (root.brightnessSetQueued) {
+        root.brightnessSetQueued = false
+        root.applyBrightness()
+      } else {
+        // Re-read once the write settled to pick up the real value.
+        monitorStateProc.running = true
       }
     }
   }
@@ -958,7 +1042,10 @@ Panel {
         PanelHero {
           width: parent.width
           title: "Control Panel"
-          meta: root.hostname !== "" ? root.hostname.toUpperCase() : "SYSTEM"
+          meta: {
+            var host = root.hostname !== "" ? root.hostname.toUpperCase() : "SYSTEM"
+            return root.themeName !== "" ? host + "\n" + root.themeName : host
+          }
           foreground: root.foreground
           fontFamily: root.fontFamily
           iconComponent: Component {
@@ -1030,26 +1117,6 @@ Panel {
         PanelSeparator { foreground: root.foreground }
 
         PanelSectionHeader {
-          text: "AUDIO"
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-        }
-
-        SliderRow {
-          width: parent.width
-          icon: root.muted ? root.glyphMute : root.glyphVolume
-          label: "Volume"
-          sub: root.sinkName
-          valueText: root.muted ? "Muted" : Math.round(root.volume * 100) + "%"
-          value: root.muted ? 0 : root.volume
-          onMoved: function(v) { root.setVolume(v) }
-          onReleased: function(v) { root.setVolume(v) }
-          onSecondary: root.toggleMute()
-        }
-
-        PanelSeparator { foreground: root.foreground }
-
-        PanelSectionHeader {
           text: "DISPLAY"
           foreground: root.foreground
           fontFamily: root.fontFamily
@@ -1071,6 +1138,26 @@ Panel {
           value: root.brightness >= 0 ? root.brightness / 100 : 0
           onMoved: function(v) { root.stageBrightness(v) }
           onReleased: function(v) { root.commitBrightness(v) }
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        PanelSectionHeader {
+          text: "AUDIO"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        SliderRow {
+          width: parent.width
+          icon: root.muted ? root.glyphMute : root.glyphVolume
+          label: "Volume"
+          sub: root.sinkName
+          valueText: root.muted ? "Muted" : Math.round(root.volume * 100) + "%"
+          value: root.muted ? 0 : root.volume
+          onMoved: function(v) { root.setVolume(v) }
+          onReleased: function(v) { root.setVolume(v) }
+          onSecondary: root.toggleMute()
         }
 
         PanelSeparator {
@@ -1217,6 +1304,30 @@ Panel {
           icon: root.glyphSpeedometer
           label: "Link speed"
           value: root.netLinkSpeed !== "" ? root.netLinkSpeed : "--"
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(10)
+
+          PanelSectionHeader {
+            text: "DNS PROVIDER"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          ButtonGroup {
+            width: parent.width
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            options: root.dnsProviders
+            value: root.dnsProvider
+            onChanged: function(v) { root.setDns(v) }
+          }
         }
 
         PanelSeparator { foreground: root.foreground }
