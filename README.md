@@ -59,6 +59,7 @@ toggles Wi-Fi) opens a detail page inside the same popup, with a back button or
 | IP address + gateway | `omarchy-network-status --verbose` |
 | Latency | `internet_ping_ms` |
 | Link speed | negotiated link rate |
+| **Wi-Fi networks** | live scan from Quickshell's `Networking` service |
 | **DNS provider** | `omarchy-dns` (DHCP / Cloudflare / Google / Custom) |
 | **Speed test** | `omarchy-network-speedtest down\|up` |
 
@@ -71,6 +72,27 @@ The **Run speed test** button measures download for a few seconds, then upload,
 showing live Mbps (the same engine the built-in `omarchy.speedtest` uses). It
 runs on demand and stops automatically when you leave the page or close the
 panel, so it never saturates the link in the background.
+
+#### Wi-Fi networks
+
+On a machine with a Wi-Fi card the connection details are followed by the
+nearby networks:
+
+- Click a network to connect. A **protected network with no saved credentials**
+  expands an inline field underneath the row for the passphrase; **WPA-Enterprise**
+  networks also ask for an identity. Enter (or the check button) connects, `Esc`
+  cancels.
+- A wrong passphrase shows **Wrong password** and reopens the field so it can be
+  re-entered.
+- Left-click a connected network to **disconnect** it.
+- Right-click (or press-and-hold) a saved but disconnected network to **forget**
+  it.
+- Scanning starts when the page opens and stops when you leave it or close the
+  panel, so the radio is not held scanning in the background.
+
+This mirrors the built-in `omarchy.network` panel: rows are primitive snapshots
+and the live network is resolved by SSID when you act, so NetworkManager churn
+(scans, AP removals) can't crash the shell.
 
 ### Bluetooth detail page
 
@@ -133,6 +155,8 @@ Only standard Omarchy tooling, all present on a stock install:
 - `omarchy-network-status`
 - `omarchy-network-speedtest` (for the Network detail page's speed test)
 - `omarchy-dns` (Network detail page: provider pills)
+- NetworkManager via Quickshell's `Networking` service (Wi-Fi networks list and connect)
+- `nmcli` and `uuidgen` (Wi-Fi networks: 802.1X / WPA-Enterprise profiles)
 - `omarchy-bluetooth-power`
 - `omarchy-bluetooth-device` (connect / disconnect / pair / forget)
 - `omarchy-monitor-state` (Display detail page: focused monitor, scale, outputs)

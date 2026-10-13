@@ -8,6 +8,7 @@ import Quickshell.Services.Pipewire
 import Quickshell.Services.UPower
 import qs.Commons
 import qs.Ui
+import "NetworkModel.js" as NetModel
 
 // oma.controlpanel — a control center for the Omarchy bar.
 //
@@ -34,8 +35,8 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color accent: Color.accent
+  readonly property color foreground: bar ? bar.foreground : ShellColor.foreground
+  readonly property color accent: ShellColor.accent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color dim: Qt.darker(foreground, 1.4)
 
@@ -65,6 +66,8 @@ Panel {
   readonly property string glyphDownload: "󰇚"
   readonly property string glyphUpload: "󰕒"
   readonly property string glyphTheme: "󰏘"
+  readonly property string glyphWifiLock: "󰌾"
+  readonly property string glyphWifiCheck: "󰄬"
 
   // ------------------------------------------------------------ live state
   readonly property var netDevices: Networking.devices ? Networking.devices.values : []
@@ -74,6 +77,20 @@ Panel {
     return false
   }
   readonly property bool wifiOn: Networking.wifiEnabled
+  // Connected-first Wi-Fi device for the network list. A machine can expose
+  // several NICs of the same type, and the first-enumerated one may be
+  // carrierless, so prefer whichever is up.
+  readonly property var wifiDevice: {
+    var fallback = null
+    for (var i = 0; i < netDevices.length; i++) {
+      var d = netDevices[i]
+      if (!d || d.type !== DeviceType.Wifi) continue
+      if (d.connected) return d
+      if (!fallback) fallback = d
+    }
+    return fallback
+  }
+  readonly property var wifiNetworkObjects: wifiDevice && wifiDevice.networks ? wifiDevice.networks.values : []
   // { type, name } from `omarchy-network-status`; empty until the first poll.
   property var netInfo: ({})
   // System DNS provider from `omarchy-dns`; the Network page's pills write it.
@@ -134,6 +151,24 @@ Panel {
   // gateway, iface, type, speed, internet_ping_ms.
   property var netDetail: ({})
   property bool netDetailLoaded: false
+
+  // Wi-Fi list on the Network page. Rows are primitive snapshots (ssid +
+  // flags) so NetworkManager churn never leaves a live wrapper in a delegate;
+  // actions resolve the WifiNetwork by SSID at click time.
+  property var wifiNetworks: []
+  property bool wifiScanning: false
+  property string wifiActionSsid: ""
+  property string wifiActionKind: ""   // "connect" | "disconnect" | "forget"
+  property string wifiFailureSsid: ""
+  property string wifiFailureReason: ""
+  // The row currently expanded into password-entry mode ("" = none). Kept open
+  // across the poll so a slow scan doesn't collapse the input being typed.
+  property string passwordSsid: ""
+  property string passwordText: ""
+  property string identityText: ""
+  // The device this panel turned scanning on for. WifiDevice has no reference
+  // counting, so remember whose scanner we own and release only that one.
+  property var wifiScannerDevice: null
 
   // Speed test, modelled on the built-in omarchy.speedtest panel: measure
   // download for a few seconds, then upload, streaming Mbps from
@@ -228,6 +263,16 @@ Panel {
     return (p < 10 ? p.toFixed(1) : String(Math.round(p))) + " ms"
   }
   readonly property string speedDownText: formatMbps(speedDown)
+  readonly property bool wifiBusy: wifiActionKind !== ""
+  // ConnectionFailReason values as a plain object, so NetworkModel.js helpers
+  // stay pure JS.
+  readonly property var connectionFailReasons: ({
+    NoSecrets: ConnectionFailReason.NoSecrets,
+    WifiAuthTimeout: ConnectionFailReason.WifiAuthTimeout,
+    WifiNetworkLost: ConnectionFailReason.WifiNetworkLost,
+    WifiClientDisconnected: ConnectionFailReason.WifiClientDisconnected,
+    WifiClientFailed: ConnectionFailReason.WifiClientFailed
+  })
   readonly property string speedUpText: formatMbps(speedUp)
   readonly property bool speedHasResult: speedDownText !== "" || speedUpText !== ""
 
@@ -338,6 +383,7 @@ Panel {
     if (page === "network") {
       netDetailProc.running = true
       dnsGetProc.running = true
+      syncWifiNetworks()
     }
     if (page === "themes") {
       themeListProc.running = true
@@ -358,6 +404,8 @@ Panel {
       // the Bluetooth radio scanning.
       stopSpeedTest()
       stopBtDiscovery()
+      cancelPasswordPrompt()
+      setWifiScanner(false)
       page = "home"
     }
   }
@@ -432,6 +480,9 @@ Panel {
     page = "network"
     netDetailProc.running = true
     dnsGetProc.running = true
+    wifiScanning = true
+    setWifiScanner(true)
+    wifiScanSettle.restart()
   }
 
   function updateDns(raw) {
@@ -455,7 +506,160 @@ Panel {
   function backToHome() {
     stopSpeedTest()
     stopBtDiscovery()
+    cancelPasswordPrompt()
+    setWifiScanner(false)
     page = "home"
+  }
+
+  // ----------------------------------------------------------- wifi actions
+  function wifiIconFor(strength) {
+    return NetModel.wifiIconFor(strength)
+  }
+
+  function requiresWifiCredentials(security) {
+    return NetModel.requiresCredentials(security, WifiSecurityType.Open, WifiSecurityType.Owe)
+  }
+
+  function canForgetWifi(row) {
+    return !!(row && row.known && !row.connected)
+  }
+
+  // Resolve the live WifiNetwork behind a primitive row/SSID.
+  function networkForSsid(ssid) {
+    var nets = wifiNetworkObjects || []
+    for (var i = 0; i < nets.length; i++)
+      if (nets[i] && nets[i].name === ssid) return nets[i]
+    return null
+  }
+
+  function syncWifiNetworks() {
+    var nets = []
+    var objs = wifiNetworkObjects || []
+    for (var i = 0; i < objs.length; i++) {
+      var n = objs[i]
+      if (!n) continue
+      checkWifiActionCompletion(n)
+      var row = NetModel.wifiRow(n)
+      if (row) nets.push(row)
+    }
+    // Reassign only when the list actually changed: a plain reassign would
+    // rebuild every delegate on the 4s poll and tear down an open passphrase
+    // prompt (and its focus) underneath the user.
+    var sorted = NetModel.sortWifiRows(nets)
+    if (JSON.stringify(sorted) !== JSON.stringify(wifiNetworks)) wifiNetworks = sorted
+    // Stop showing the scanning state once results start landing; the settle
+    // timer ends it for an empty scan.
+    if (sorted.length > 0) wifiScanning = false
+  }
+
+  // WifiDevice's scanner flag has no reference counting, so only ever release
+  // the device this instance turned on.
+  function setWifiScanner(enabled) {
+    var next = (opened && page === "network") ? wifiDevice : null
+    if (wifiScannerDevice && wifiScannerDevice !== next)
+      wifiScannerDevice.scannerEnabled = false
+    wifiScannerDevice = next
+    if (wifiScannerDevice) wifiScannerDevice.scannerEnabled = enabled
+  }
+
+  function openPasswordPrompt(ssid) {
+    if (passwordSsid !== ssid) {
+      passwordText = ""
+      identityText = ""
+    }
+    passwordSsid = ssid
+  }
+
+  function cancelPasswordPrompt() {
+    passwordSsid = ""
+    passwordText = ""
+    identityText = ""
+  }
+
+  // One Wi-Fi action at a time, mirroring the built-in panel. `callback`
+  // receives the live WifiNetwork so callers only resolve it once.
+  function runWifiAction(kind, network, callback) {
+    if (wifiActionKind !== "" || !network) return
+    wifiActionSsid = network.name || ""
+    wifiActionKind = kind
+    wifiFailureSsid = ""
+    wifiFailureReason = ""
+    callback(network)
+    // Safety net: if the completion signal never arrives, don't leave the row
+    // stuck on "Connecting…" forever.
+    wifiActionTimeout.restart()
+  }
+
+  function clearWifiAction() {
+    wifiActionTimeout.stop()
+    if (wifiActionKind === "connect") cancelPasswordPrompt()
+    wifiFailureSsid = ""
+    wifiFailureReason = ""
+    wifiActionSsid = ""
+    wifiActionKind = ""
+    syncWifiNetworks()
+  }
+
+  function failWifiAction(network, reason) {
+    if (!network || wifiActionKind === "" || wifiActionSsid !== (network.name || "")) return
+    wifiActionTimeout.stop()
+    wifiFailureSsid = wifiActionSsid
+    wifiFailureReason = NetModel.networkFailureReason(reason, requiresWifiCredentials(network.security), connectionFailReasons)
+    wifiActionSsid = ""
+    wifiActionKind = ""
+    syncWifiNetworks()
+  }
+
+  function checkWifiActionCompletion(network) {
+    if (!network || wifiActionKind === "" || wifiActionSsid !== (network.name || "")) return
+    if (wifiActionKind === "connect" && network.connected) clearWifiAction()
+    else if (wifiActionKind === "disconnect" && !network.connected && !network.stateChanging) clearWifiAction()
+    else if (wifiActionKind === "forget" && !network.known && !network.stateChanging) clearWifiAction()
+  }
+
+  function connectWifiDirectly(ssid) {
+    runWifiAction("connect", networkForSsid(ssid), function(network) { network.connect() })
+  }
+
+  function connectWifiWithPassphrase(ssid, passphrase) {
+    runWifiAction("connect", networkForSsid(ssid), function(network) { network.connectWithPsk(passphrase) })
+  }
+
+  function connectWifiEnterprise(ssid, identity, passphrase) {
+    runWifiAction("connect", networkForSsid(ssid), function(network) {
+      enterpriseConnect.secret = passphrase
+      enterpriseConnect.command = ["bash", "-c", NetModel.enterpriseConnectScript, "nmcli-eap", ssid, identity]
+      enterpriseConnect.running = true
+    })
+  }
+
+  function disconnectWifi(network) {
+    if (!network) return
+    runWifiAction("disconnect", network, function(net) { net.disconnect() })
+  }
+
+  function disconnectWifiRow(ssid) {
+    var network = networkForSsid(ssid)
+    if (network) disconnectWifi(network)
+  }
+
+  function forgetWifi(row) {
+    var network = row ? networkForSsid(row.ssid) : null
+    runWifiAction("forget", network, function(net) { net.forget() })
+  }
+
+  // Left click connects/disconnects; a protected network we have no saved
+  // credentials for opens the inline prompt first.
+  function activateWifiRow(row) {
+    if (!row || wifiBusy) return
+    if (row.connected) { disconnectWifiRow(row.ssid); return }
+    if (requiresWifiCredentials(row.security) && !row.known) { openPasswordPrompt(row.ssid); return }
+    connectWifiDirectly(row.ssid)
+  }
+
+  // Right click / press-and-hold forgets a saved but disconnected network.
+  function wifiSecondary(row) {
+    if (canForgetWifi(row)) forgetWifi(row)
   }
 
   function startSpeedTest() {
@@ -862,6 +1066,18 @@ Panel {
     }
   }
 
+  // Creates and activates the 802.1X profile (see NetworkModel.js). The
+  // password goes over stdin, never argv.
+  Process {
+    id: enterpriseConnect
+    property string secret: ""
+    stdinEnabled: true
+    onStarted: {
+      write(secret + "\n")
+      secret = ""
+    }
+  }
+
   Process {
     id: nightlightGetProc
     command: ["omarchy-toggle-nightlight", "--status"]
@@ -1110,6 +1326,39 @@ Panel {
     onTriggered: root.btPending = ({})
   }
 
+  // NetworkManager takes a moment to publish scan results after the scanner is
+  // switched on; re-sync once it has had a chance to land and stop showing the
+  // scanning state even if the scan came back empty.
+  Timer {
+    id: wifiScanSettle
+    interval: 1500
+    repeat: false
+    onTriggered: {
+      root.syncWifiNetworks()
+      root.wifiScanning = false
+    }
+  }
+
+  // Must outlast NetworkManager's 25s supplicant timeout: a wrong saved PSK
+  // fails with WifiAuthTimeout at ~25s, and that failure has to land while the
+  // action is still tracked so the row can show "Wrong password".
+  Timer {
+    id: wifiActionTimeout
+    interval: 30000
+    repeat: false
+    onTriggered: {
+      if (!root.wifiActionKind) return
+      var reason = root.wifiActionKind === "connect" ? "Timed out connecting"
+                 : root.wifiActionKind === "disconnect" ? "Timed out disconnecting"
+                 : "Timed out forgetting"
+      root.wifiFailureSsid = root.wifiActionSsid
+      root.wifiFailureReason = reason
+      root.wifiActionSsid = ""
+      root.wifiActionKind = ""
+      root.syncWifiNetworks()
+    }
+  }
+
   Connections {
     target: root.btAdapter
     function onDiscoveringChanged() {
@@ -1135,6 +1384,19 @@ Panel {
     }
   }
 
+  // Scan results (and the device itself) churn as NetworkManager works; rebuild
+  // the primitive row list whenever they change.
+  onWifiNetworkObjectsChanged: syncWifiNetworks()
+  onWifiDeviceChanged: {
+    syncWifiNetworks()
+    if (root.opened && root.page === "network") setWifiScanner(true)
+  }
+
+  // Never leave the radio scanning after this instance goes away.
+  Component.onDestruction: {
+    if (wifiScannerDevice) wifiScannerDevice.scannerEnabled = false
+  }
+
   // -------------------------------------------------------------------- UI
   KeyboardPanel {
     id: panel
@@ -1149,6 +1411,10 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // While the inline passphrase prompt is open the TextField owns the
+      // keyboard; without this the "r"/"R" refresh shortcut (and j/k/h/l) would
+      // steal keystrokes from the field.
+      blocked: root.passwordSsid !== ""
       onCloseRequested: {
         // Esc walks back from a sub-page before it dismisses the panel.
         if (root.page !== "home") root.backToHome()
@@ -1456,6 +1722,62 @@ Panel {
           value: root.netLinkSpeed !== "" ? root.netLinkSpeed : "--"
         }
 
+        PanelSeparator {
+          visible: root.hasWifi
+          foreground: root.foreground
+        }
+
+        Column {
+          visible: root.hasWifi
+          width: parent.width
+          spacing: Style.space(10)
+
+          PanelSectionHeader {
+            text: root.wifiScanning ? "WI-FI NETWORKS · SCANNING" : "WI-FI NETWORKS"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          // A busy room can turn up a long list; cap the height and scroll so
+          // the card never grows past the screen.
+          Flickable {
+            id: wifiList
+            width: parent.width
+            visible: root.wifiNetworks.length > 0
+            height: visible ? Math.min(wifiListContent.implicitHeight, Style.space(320)) : 0
+            contentHeight: wifiListContent.implicitHeight
+            clip: true
+            interactive: contentHeight > height
+            boundsBehavior: Flickable.StopAtBounds
+
+            Column {
+              id: wifiListContent
+              width: parent.width
+              spacing: Style.space(6)
+
+              Repeater {
+                model: root.wifiNetworks
+                delegate: WifiRow {
+                  width: wifiListContent.width
+                }
+              }
+            }
+          }
+
+          Text {
+            width: parent.width
+            visible: root.wifiNetworks.length === 0
+            text: {
+              if (!root.wifiOn) return "Turn Wi-Fi on to see networks"
+              return root.wifiScanning ? "Scanning for networks…" : "No networks found"
+            }
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+        }
+
         PanelSeparator { foreground: root.foreground }
 
         Column {
@@ -1613,7 +1935,7 @@ Panel {
               width: parent.width
               visible: root.speedError !== ""
               text: root.speedError
-              color: Color.urgent
+              color: ShellColor.urgent
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.Wrap
@@ -2345,6 +2667,252 @@ Panel {
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
         }
+      }
+    }
+  }
+
+  // A Wi-Fi network row: signal bars, SSID, lock for protected networks and a
+  // status line. Left click connects (or disconnects a connected one, or opens
+  // the inline passphrase prompt); right click / press-and-hold forgets a saved
+  // but disconnected network.
+  component WifiRow: BorderSurface {
+    id: wifiRow
+
+    required property var modelData
+    readonly property var row: wifiRow.modelData
+    readonly property bool isConnected: row ? row.connected === true : false
+    readonly property bool requiresCredentials: row ? root.requiresWifiCredentials(row.security) : false
+    readonly property bool isEnterprise: row
+      ? (row.security === WifiSecurityType.Wpa2Eap || row.security === WifiSecurityType.WpaEap)
+      : false
+    readonly property bool canForget: root.canForgetWifi(row)
+    readonly property bool isBusy: root.wifiActionKind !== "" && root.wifiActionSsid === (row ? row.ssid : "")
+    readonly property bool isFailed: root.wifiFailureReason !== "" && root.wifiFailureSsid === (row ? row.ssid : "")
+    readonly property bool isPasswordOpen: root.passwordSsid !== "" && root.passwordSsid === (row ? row.ssid : "")
+    readonly property bool hot: rowMouse.containsMouse
+
+    function submitCredentials() {
+      if (!row || root.wifiBusy || root.passwordText.length === 0) return
+      if (!isEnterprise) return root.connectWifiWithPassphrase(row.ssid, root.passwordText)
+      if (root.identityText.length > 0) root.connectWifiEnterprise(row.ssid, root.identityText, root.passwordText)
+    }
+
+    readonly property string statusText: {
+      if (!row) return ""
+      if (isPasswordOpen) return ""
+      if (isBusy && root.wifiActionKind === "connect") return "Connecting…"
+      if (isBusy && root.wifiActionKind === "disconnect") return "Disconnecting…"
+      if (isBusy && root.wifiActionKind === "forget") return "Forgetting…"
+      if (isFailed) return root.wifiFailureReason || "Failed"
+      if (isConnected) return "Connected"
+      if (requiresCredentials && !row.known) return "Password required"
+      return ""
+    }
+
+    readonly property color statusColor: {
+      if (isFailed) return ShellColor.urgent
+      if (isConnected) return root.foreground
+      return root.dim
+    }
+
+    readonly property color restFill: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+    readonly property color hotFill: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+
+    radius: Style.cornerRadius
+    color: hot ? hotFill : restFill
+    borderSpec: Border.controlSpec(hot ? "hover-cursor" : "normal", root.foreground, root.accent)
+    implicitHeight: wifiRowBody.implicitHeight + Style.space(18)
+                  + (isPasswordOpen ? wifiPasswordPanel.implicitHeight + Style.space(10) : 0)
+
+    // Watch the live network behind this row so an action lands (and a failed
+    // connect can reprompt) without needing the list to recycle.
+    Connections {
+      target: wifiRow.row ? root.networkForSsid(wifiRow.row.ssid) : null
+      function onConnectionFailed(reason) {
+        var ours = root.wifiActionKind === "connect" && root.wifiActionSsid === (wifiRow.row.ssid || "")
+        root.failWifiAction(root.networkForSsid(wifiRow.row.ssid), reason)
+        if (ours && NetModel.shouldRepromptPassphrase(reason, wifiRow.requiresCredentials, root.connectionFailReasons))
+          root.openPasswordPrompt(wifiRow.row.ssid)
+      }
+      function onConnectedChanged() {
+        if (wifiRow.row) root.checkWifiActionCompletion(root.networkForSsid(wifiRow.row.ssid))
+      }
+      function onKnownChanged() {
+        if (wifiRow.row) root.checkWifiActionCompletion(root.networkForSsid(wifiRow.row.ssid))
+      }
+      function onStateChangingChanged() {
+        if (wifiRow.row) root.checkWifiActionCompletion(root.networkForSsid(wifiRow.row.ssid))
+      }
+    }
+
+    MouseArea {
+      id: rowMouse
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: parent.top
+      height: wifiRowBody.implicitHeight + Style.space(18)
+      hoverEnabled: true
+      acceptedButtons: Qt.LeftButton | Qt.RightButton
+      cursorShape: Qt.PointingHandCursor
+      enabled: !root.wifiBusy
+      onClicked: function(mouse) {
+        if (!wifiRow.row) return
+        if (mouse.button === Qt.RightButton) root.wifiSecondary(wifiRow.row)
+        else root.activateWifiRow(wifiRow.row)
+      }
+      onPressAndHold: root.wifiSecondary(wifiRow.row)
+    }
+
+    Item {
+      id: wifiRowBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: parent.top
+      anchors.topMargin: Style.space(9)
+      anchors.leftMargin: Style.space(12)
+      anchors.rightMargin: Style.space(12)
+      implicitHeight: Math.max(wifiRowIcon.implicitHeight, wifiRowLabels.implicitHeight, wifiRowLock.implicitHeight)
+
+      Text {
+        id: wifiRowIcon
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        text: wifiRow.row ? root.wifiIconFor(wifiRow.row.signal) : ""
+        color: wifiRow.isConnected ? root.foreground : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.heading
+      }
+
+      Text {
+        id: wifiRowLock
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        visible: wifiRow.requiresCredentials
+        text: root.glyphWifiLock
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+
+      Column {
+        id: wifiRowLabels
+        anchors.left: wifiRowIcon.right
+        anchors.leftMargin: Style.space(10)
+        anchors.right: wifiRowLock.visible ? wifiRowLock.left : parent.right
+        anchors.rightMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(1)
+
+        Text {
+          width: parent.width
+          text: wifiRow.row ? (wifiRow.row.ssid !== "" ? wifiRow.row.ssid : "Hidden network") : ""
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+        }
+        Text {
+          width: parent.width
+          visible: wifiRow.statusText !== ""
+          text: wifiRow.statusText
+          color: wifiRow.statusColor
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+    }
+
+    // Inline passphrase prompt, shown when a protected network has no saved
+    // credentials or a connect failed with the saved passphrase. Enterprise
+    // networks also ask for an identity. Enter or the check button connects;
+    // Esc cancels.
+    Item {
+      id: wifiPasswordPanel
+      visible: wifiRow.isPasswordOpen
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: wifiRowBody.bottom
+      anchors.topMargin: Style.space(6)
+      anchors.leftMargin: Style.space(12)
+      anchors.rightMargin: Style.space(12)
+      implicitHeight: (wifiIdField.visible ? wifiIdField.implicitHeight + Style.space(4) : 0)
+                    + wifiPwField.implicitHeight
+
+      TextField {
+        id: wifiIdField
+        visible: wifiRow.isEnterprise && !wifiRow.isBusy && !wifiRow.isFailed
+        anchors.left: parent.left
+        anchors.right: wifiConnectBtn.left
+        anchors.top: parent.top
+        anchors.rightMargin: Style.space(6)
+        placeholderText: "Identity (user@domain)"
+        foreground: root.foreground
+        accent: root.accent
+        horizontalPadding: Style.spacing.controlGap
+        verticalPadding: Style.spacing.controlPaddingY
+        enabled: !wifiRow.isBusy
+        text: wifiRow.isPasswordOpen ? root.identityText : ""
+        onAccepted: wifiPwField.forceActiveFocus()
+        onTextChanged: if (wifiRow.isPasswordOpen && text !== root.identityText) root.identityText = text
+        Keys.onEscapePressed: root.cancelPasswordPrompt()
+        onVisibleChanged: if (visible) Qt.callLater(forceActiveFocus)
+        Component.onCompleted: if (visible) Qt.callLater(forceActiveFocus)
+      }
+
+      TextField {
+        id: wifiPwField
+        visible: !wifiRow.isBusy && !wifiRow.isFailed
+        anchors.left: parent.left
+        anchors.right: wifiConnectBtn.left
+        anchors.bottom: parent.bottom
+        anchors.rightMargin: Style.space(6)
+        password: true
+        placeholderText: "Passphrase"
+        foreground: root.foreground
+        accent: root.accent
+        horizontalPadding: Style.spacing.controlGap
+        verticalPadding: Style.spacing.controlPaddingY
+        enabled: !wifiRow.isBusy
+        text: wifiRow.isPasswordOpen ? root.passwordText : ""
+        onAccepted: wifiRow.submitCredentials()
+        onTextChanged: if (wifiRow.isPasswordOpen && text !== root.passwordText) root.passwordText = text
+        Keys.onEscapePressed: root.cancelPasswordPrompt()
+        onVisibleChanged: if (visible && !wifiRow.isEnterprise) Qt.callLater(forceActiveFocus)
+        Component.onCompleted: if (visible && !wifiRow.isEnterprise) Qt.callLater(forceActiveFocus)
+      }
+
+      BorderSurface {
+        visible: wifiRow.isBusy || wifiRow.isFailed
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        implicitHeight: Style.spacing.controlHeight
+        color: Style.normalFillFor(root.foreground)
+        borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+
+        Text {
+          anchors.fill: parent
+          horizontalAlignment: Text.AlignHCenter
+          verticalAlignment: Text.AlignVCenter
+          text: wifiRow.isFailed ? "Wrong password" : "Connecting…"
+          color: wifiRow.isFailed ? ShellColor.urgent : root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+      }
+
+      PanelActionButton {
+        id: wifiConnectBtn
+        visible: !wifiRow.isBusy && !wifiRow.isFailed
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        enabled: wifiRow.row && wifiPwField.text.length > 0 && (!wifiRow.isEnterprise || wifiIdField.text.length > 0)
+        iconText: root.glyphWifiCheck
+        tooltipText: "Connect"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onClicked: wifiRow.submitCredentials()
       }
     }
   }
